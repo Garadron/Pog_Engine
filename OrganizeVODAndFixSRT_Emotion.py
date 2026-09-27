@@ -1629,10 +1629,10 @@ ANALYSIS_STAGE_DETAILS = {
     "5e. Judging": {
         "task": "Judging: ranking the candidate pool",
         "model": f"Model: {JUDGE_MODEL}",
-        "next": "Next: Export — write CSV, EDL, and run metadata",
+        "next": "Next: Export — write CSV, EDL, Premiere XML, and run metadata",
     },
     "5f. Export": {
-        "task": "Export: writing CSV, EDL, and run metadata",
+        "task": "Export: writing CSV, EDL, Premiere XML, and run metadata",
         "model": "Model: none",
         "next": "",
     },
@@ -2012,7 +2012,7 @@ MINI_DESCRIPTIONS = {
         "5c": "The local speech-emotion model scores audio around each candidate; emotion and hype-phrase boosts are applied to the scores.",
         "5d": "The judge LLM checks each candidate batch against the transcript; unsupported or hallucinated timestamps are dropped.",
         "5e": "A tournament batch ranks the candidate pool down to TOP_N with a 5-factor priority order.",
-        "5f": "Rank-calibrated scores become top<N>_highlights.csv, a Resolve EDL marker file, and run_info.json.",
+        "5f": "Rank-calibrated scores become top<N>_highlights.csv, a Resolve EDL marker file, a Premiere Pro XML sequence, and run_info.json.",
     },
 }
 MINI_DESCRIPTIONS_SINGLE_TRACK_STEP1 = {
@@ -4500,7 +4500,7 @@ def organize_video(video_file: Path) -> Path:
     print("   5c_EmotionScoring.bat   <- force-rerun just the speech-emotion model")
     print("   5d_Verify.bat           <- force-rerun just the content verification pass")
     print("   5e_Judge.bat            <- force-rerun just the final ranking")
-    print("   5f_Export.bat           <- rewrite the CSV + Resolve EDL from the last judged result")
+    print("   5f_Export.bat           <- rewrite the CSV + Resolve EDL + Premiere XML from the last judged result")
     print("   (5a-5f debug bats are inside step5_analyze_highlights/)")
     print("\nStep 5 checkpoints internally after each of its sub-stages, so if it dies or")
     print("you hit Stop in the RunAll GUI partway through, running it again (or")

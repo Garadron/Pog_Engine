@@ -389,9 +389,10 @@ def invalidate_downstream(stream_folder, from_stage):
     for path in Path(step_subdir(stream_folder, 5)).glob("top*_highlights.csv"):
         path.unlink()
         removed.append(path.name)
-    for path in Path(stream_folder).glob("top*_markers.edl"):
-        path.unlink()
-        removed.append(path.name)
+    for pattern in ("top*_markers.edl", "top*_premiere.xml"):
+        for path in Path(stream_folder).glob(pattern):
+            path.unlink()
+            removed.append(path.name)
 
     if removed:
         print(f"Invalidated {len(removed)} stale downstream file(s): {', '.join(removed)}")
@@ -2346,6 +2347,151 @@ def write_highlights_edl(stream_folder, final_highlights, top_n):
 
     return edl_path
 
+def probe_video_format(video_path):
+    """(fps, width, height, duration_seconds, audio_channel_counts) of the
+    source video via ffprobe, or None if ffprobe is missing or the probe fails."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=codec_type,r_frame_rate,width,height,channels:format=duration",
+                "-of", "json", video_path,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        info = json.loads(result.stdout)
+        streams = info["streams"]
+        video = next(s for s in streams if s.get("codec_type") == "video")
+        num, den = map(int, video["r_frame_rate"].split("/"))
+        audio_channels = [int(s.get("channels") or 2) for s in streams if s.get("codec_type") == "audio"]
+        return num / den, int(video["width"]), int(video["height"]), float(info["format"]["duration"]), audio_channels
+    except (FileNotFoundError, subprocess.TimeoutExpired, StopIteration, ValueError, KeyError, ZeroDivisionError):
+        return None
+
+def write_highlights_premiere_xml(stream_folder, final_highlights, top_n):
+    """Final Cut Pro 7 XML (xmeml) for Premiere Pro's File > Import: a sequence
+    with the source VOD on V1/A1..An and one sequence marker per highlight.
+    Falls back to a markers-only sequence if the video can't be found/probed."""
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote
+
+    xml_path = os.path.join(stream_folder, f"top{top_n}_premiere.xml")  # VOD root: Premiere hand-off file
+
+    video_path = find_source_video(stream_folder)
+    probe = probe_video_format(video_path) if video_path else None
+    if probe:
+        fps, width, height, duration_seconds, audio_channels = probe
+    else:
+        fps, width, height, audio_channels = 30.0, 1920, 1080, []
+        last = max((timestamp_to_seconds(h["Timestamp"]) for h in final_highlights), default=0)
+        duration_seconds = last + 10
+        if video_path:
+            print("[premiere] ffprobe unavailable or failed; writing a markers-only Premiere sequence.")
+        else:
+            print("[premiere] No source video found; writing a markers-only Premiere sequence.")
+
+    timebase = round(fps)
+    ntsc = "TRUE" if abs(fps - timebase) > 0.01 else "FALSE"
+    total_frames = max(1, round(duration_seconds * fps))
+
+    def sub(parent, tag, text=None):
+        el = ET.SubElement(parent, tag)
+        if text is not None:
+            el.text = str(text)
+        return el
+
+    def add_rate(parent):
+        rate = sub(parent, "rate")
+        sub(rate, "timebase", timebase)
+        sub(rate, "ntsc", ntsc)
+
+    def add_video_characteristics(parent):
+        chars = sub(parent, "samplecharacteristics")
+        add_rate(chars)
+        sub(chars, "width", width)
+        sub(chars, "height", height)
+        sub(chars, "pixelaspectratio", "square")
+
+    root = ET.Element("xmeml", version="4")
+    seq = sub(root, "sequence", None)
+    seq.set("id", "sequence-1")
+    sub(seq, "name", f"TOP{top_n}_HIGHLIGHTS")
+    sub(seq, "duration", total_frames)
+    add_rate(seq)
+
+    media = sub(seq, "media")
+    video_el = sub(media, "video")
+    add_video_characteristics(sub(video_el, "format"))
+    video_track = sub(video_el, "track")
+    audio_el = sub(media, "audio")
+
+    if probe:
+        clip_name = os.path.basename(video_path)
+        clip_ids = ["clipitem-v1"] + [f"clipitem-a{i}" for i in range(1, len(audio_channels) + 1)]
+
+        def add_clipitem(track, clip_id, write_file, audio_index=None):
+            item = sub(track, "clipitem")
+            item.set("id", clip_id)
+            sub(item, "name", clip_name)
+            sub(item, "enabled", "TRUE")
+            sub(item, "duration", total_frames)
+            add_rate(item)
+            sub(item, "start", 0)
+            sub(item, "end", total_frames)
+            sub(item, "in", 0)
+            sub(item, "out", total_frames)
+            file_el = sub(item, "file")
+            file_el.set("id", "file-1")
+            if write_file:
+                sub(file_el, "name", clip_name)
+                sub(file_el, "pathurl", "file://localhost/" + quote(Path(video_path).as_posix(), safe="/"))
+                add_rate(file_el)
+                sub(file_el, "duration", total_frames)
+                file_media = sub(file_el, "media")
+                add_video_characteristics(sub(file_media, "video"))
+                for index, channels in enumerate(audio_channels, start=1):
+                    file_audio = sub(file_media, "audio")
+                    sub(file_audio, "trackindex", index)
+                    sub(file_audio, "channelcount", channels)
+            if audio_index is not None:
+                source = sub(item, "sourcetrack")
+                sub(source, "mediatype", "audio")
+                sub(source, "trackindex", audio_index)
+            for link_index, link_id in enumerate(clip_ids):
+                link = sub(item, "link")
+                sub(link, "linkclipref", link_id)
+                sub(link, "mediatype", "video" if link_index == 0 else "audio")
+                sub(link, "trackindex", 1 if link_index == 0 else link_index)
+                sub(link, "clipindex", 1)
+
+        add_clipitem(video_track, clip_ids[0], write_file=True)
+        for index in range(1, len(audio_channels) + 1):
+            add_clipitem(sub(audio_el, "track"), clip_ids[index], write_file=False, audio_index=index)
+
+    timecode = sub(seq, "timecode")
+    add_rate(timecode)
+    sub(timecode, "string", "00:00:00:00")
+    sub(timecode, "frame", 0)
+    sub(timecode, "displayformat", "NDF")
+
+    for rank, h in enumerate(final_highlights, start=1):
+        category = h.get("Category", "")
+        category_tag = f"[{category}] " if category else ""
+        title = h["Title"].replace("\n", " ").strip()
+        marker = sub(seq, "marker")
+        sub(marker, "comment", h.get("Reason", "").replace("\n", " ").strip())
+        sub(marker, "name", f"#{rank} {category_tag}{title} (Score {h['Score']})")
+        sub(marker, "in", round(timestamp_to_seconds(h["Timestamp"]) * fps))
+        sub(marker, "out", -1)
+
+    ET.indent(root, space="  ")
+    with open(xml_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n')
+        f.write(ET.tostring(root, encoding="unicode"))
+        f.write("\n")
+
+    return xml_path
+
 def write_run_info(stream_folder, final_highlights):
     """Snapshots the models/settings used and the accumulated pipeline
     stats (Ollama calls, per-stage timing) into run_info.json."""
@@ -2955,6 +3101,7 @@ def run_stage_export(stream_folder):
 
         csv_path = write_highlights_csv(stream_folder, final_highlights, TOP_N)
         edl_path = write_highlights_edl(stream_folder, final_highlights, TOP_N)
+        premiere_xml_path = write_highlights_premiere_xml(stream_folder, final_highlights, TOP_N)
 
         if EXPORT_PREVIEW_CLIPS:
             export_preview_clips(stream_folder, final_highlights, PREVIEW_CLIP_SECONDS_BEFORE, PREVIEW_CLIP_SECONDS_AFTER)
@@ -2966,6 +3113,7 @@ def run_stage_export(stream_folder):
         print(f"Top {TOP_N} highlights saved:")
         print(csv_path)
         print(edl_path)
+        print(premiere_xml_path)
         print("=" * 60)
 
         stats = load_pipeline_stats(stream_folder)

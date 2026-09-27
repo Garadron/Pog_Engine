@@ -82,7 +82,7 @@ VOD**fixed**.srt (must have fixed in name)
 highlights.edl (your highlight markers)
 
 
-You are welcomed to use any marker conversion tool to convert Davinci Resolve markers to use in other programs.
+Using Adobe Premiere Pro instead? Import `top<N>_premiere.xml` (File > Import) from the VOD folder: it creates a sequence with your VOD already on the timeline and one marker per highlight (rank, category, title, and score in the marker name; the judge's reason in the comment). Marker colors are DaVinci-only. If ffprobe can't read the video, the XML still contains the markers but no clip, so you'll need to drop the VOD in yourself.
 
 
 ## Configure Pog Engine (ADVANCED USER ONLY)
