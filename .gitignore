@@ -1,2 +1,10 @@
 *.zip
 *.rar
+
+# Local runtime artifacts / downloaded models - never commit these (multi-GB binaries)
+__pycache__/
+*.pyc
+ffmpeg/
+models/
+pipeline_run_history.csv
+

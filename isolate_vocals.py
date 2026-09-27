@@ -52,8 +52,8 @@ from pipeline_config import (
 # creates its own checkpoints\ subdirectory structure there that shouldn't
 # mix with the flat model files check_models() in pog_engine_setup.py
 # expects to see.
-TORCH_CACHE_DIR = r"G:\pog_dev\models\torch_cache"
-HF_CACHE_DIR = r"G:\pog_dev\models\hf_cache"
+TORCH_CACHE_DIR = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\torch_cache"
+HF_CACHE_DIR = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\hf_cache"
 
 
 

@@ -67,13 +67,13 @@ ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
 # Used only when count_audio_streams() below detects a single-track (Twitch-
 # style) VOD - see make_extract_mic_bat_singletrack().
 ISOLATE_VOCALS_SCRIPT = SCRIPT_DIR / "isolate_vocals.py"
-GALLERY_DIR = Path(r"G:\pog_dev\gallery\best of")
+GALLERY_DIR = Path(r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\gallery\best of")
 GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 # Edit these if your whisper.cpp install moves.
-WHISPER_CLI = r"G:\pog_dev\models\Release\whisper-cli.exe"
-WHISPER_MODEL = r"G:\pog_dev\models\ggml-large-v3.bin"
-WHISPER_VAD = r"G:\pog_dev\models\ggml-silero-v6.2.0.bin"
+WHISPER_CLI = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\Release\whisper-cli.exe"
+WHISPER_MODEL = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\ggml-large-v3.bin"
+WHISPER_VAD = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\ggml-silero-v6.2.0.bin"
 
 
 
