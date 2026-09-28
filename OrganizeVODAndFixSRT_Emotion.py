@@ -62,6 +62,10 @@ TRANSCRIPT_MERGE_TARGET_WORDS = 30
 # A gap this long between captions is a new-thought boundary when merging
 # for LLM analysis, even before the target word count above is hit.
 TRANSCRIPT_MERGE_MAX_GAP_MS = 2500
+# Max audio time one merged thought may span (see merge_entries_for_analysis()).
+# Without this, sparse speech lets a block swallow minutes of audio while keeping
+# only its first caption's timestamp, so discovery quotes tail text at head time.
+TRANSCRIPT_MERGE_MAX_SPAN_MS = 30_000
 SCRIPT_DIR = Path(__file__).resolve().parent
 ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
 # Used only when count_audio_streams() below detects a single-track (Twitch-
@@ -1086,10 +1090,13 @@ def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, 
     analyze_highlights_emotion.py.
 
     A chunk closes (a new one starts) when adding the next caption would
-    push it past TRANSCRIPT_MERGE_TARGET_WORDS words, when there's a long
-    silence gap before the next caption (a natural pause = a natural new
-    thought), or once a sentence has just ended and the chunk already has
-    a reasonable amount of text - whichever comes first. Returns
+    push it past TRANSCRIPT_MERGE_TARGET_WORDS words, stretch its audio span
+    past TRANSCRIPT_MERGE_MAX_SPAN_MS, when there's a long silence gap before
+    the next caption (a natural pause = a natural new thought), or once a
+    sentence has just ended and the chunk already has a reasonable amount of
+    text - whichever comes first. Without the span cap, sparse speech lets one
+    chunk swallow minutes of audio while keeping only its first caption's
+    timestamp, so discovery quotes tail text at the head time. Returns
     (start_ms, text) tuples.
     """
     merged: list[tuple[int, str]] = []
@@ -1106,9 +1113,11 @@ def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, 
         gap_ms = entry.start_ms - previous_end_ms if previous_end_ms is not None else 0
         ends_sentence = bool(buffer_words) and buffer_words[-1].rstrip("\"'").endswith((".", "!", "?"))
         would_exceed_target = bool(buffer_words) and len(buffer_words) + len(text.split()) > TRANSCRIPT_MERGE_TARGET_WORDS
+        span_ms = entry.start_ms - buffer_start_ms if buffer_words else 0
 
         should_close = buffer_words and (
             gap_ms > TRANSCRIPT_MERGE_MAX_GAP_MS
+            or span_ms > TRANSCRIPT_MERGE_MAX_SPAN_MS
             or would_exceed_target
             or (ends_sentence and len(buffer_words) >= MIN_SUBTITLE_WORDS)
         )
