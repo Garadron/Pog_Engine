@@ -1166,3 +1166,37 @@ The incident block now starts 01:57:12, 14 s from the true line instead of
 Re-run that VOD's `4_SplitSRT.bat`, then `5_AnalyzeHighlights.bat --stage`
 discovery onward (or all of step 5); earlier checkpoints are reused, nothing
 before step 4 re-runs.
+
+## Fix History: whisper.cpp VAD smeared timestamps over silence (2026-09-29)
+
+### Symptom
+`F:\OBS VOD\2026-09-12 12-38-30`: fixed #238 starts 1:35:37 but speech starts
+1:35:40, merging "just go mid" (1:35:46), "barrico challenge" (1:36:19),
+"freestyling" (1:36:24) into one 50 s caption; #258 spans 1:43:56-1:46:06 for
+a 2 s utterance at 1:46:02. Both already smeared in the raw chunk SRT, so
+stitching/`fix_srt`/split only propagated them.
+
+### Root cause
+`_transcribe_audio_chunk()` passed whisper.cpp `--vad` unconditionally.
+VAD concatenates detected speech (chunk 4: 29120000 -> 5079680 samples, 82.6%
+silence excised), decodes one contiguous buffer, then stretches captions back
+across the gaps: one caption per ~11 s compressed-speech span remaps onto
+minutes of wall audio (267/471 chunk blocks >12 s, worst 346 s; VAD segments
+themselves never exceed ~10 s). Mic RMS confirms silence where the long
+captions claim speech (0.0 across 1:44-1:45); the VAD segment starts
+themselves land within 1 s of true speech, only the emitted spans are fiction.
+
+### Fix
+New `TRANSCRIPTION_USE_VAD = _env_bool(..., False)` (`pipeline_config.py` +
+`EDITABLE_PARAMS` Transcription entry): `--vad` and its silero/threshold flags
+are appended only when ON; the Step 2 bat echo drops "and VAD"; the run prints
+`Whisper VAD pre-segmentation: ON/OFF`; `use_vad` joins the retry fingerprint
+so verdicts invalidate on flip, and `_clear_srts_on_vad_flip()` deletes chunk
+SRTs transcribed under the other setting (legacy state counts as VAD-on) while
+reusing chunk audio. Setup still downloads/patches `WHISPER_VAD` for A/B use.
+Script-only change: no bat regeneration, no checkpoint format change.
+
+### Resume
+Re-run the VOD's `2_TranscribeAudio.bat` (Step 1 chunks reused; stale VAD-era
+chunk SRTs auto-cleared), then steps 3-5 normally. A/B via
+`set TRANSCRIPTION_USE_VAD=1` before the Step 2 bat.

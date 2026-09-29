@@ -45,6 +45,7 @@ from pipeline_config import (
     TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_RETRY_MIN_MINUTES,
     TRANSCRIPTION_SILENCE_RMS,
+    TRANSCRIPTION_USE_VAD,
     VOCAL_ISOLATION_MODEL,
     ollama_base_url,
     ollama_is_reachable,
@@ -246,14 +247,20 @@ def _transcribe_audio_chunk(
         "--logprob-thold", "-0.8",
         "--no-speech-thold", "0.7",
         "--suppress-nst",
-        "--vad",
-        "-vm", str(WHISPER_VAD),
-        "--vad-threshold", "0.42",
-        "--vad-min-silence-duration-ms", "500",
-        "--vad-max-speech-duration-s", "30",
-        "--vad-speech-pad-ms", "200",
         "-t", "16",
     ]
+    if TRANSCRIPTION_USE_VAD:
+        # Opt-in only: VAD concatenates detected speech, decodes it as one
+        # contiguous buffer, then stretches the captions back across the
+        # excised silence, smearing timestamps over minutes of dead air.
+        command.extend([
+            "--vad",
+            "-vm", str(WHISPER_VAD),
+            "--vad-threshold", "0.42",
+            "--vad-min-silence-duration-ms", "500",
+            "--vad-max-speech-duration-s", "30",
+            "--vad-speech-pad-ms", "200",
+        ])
     result = subprocess.run(command)
     if result.returncode != 0:
         raise RuntimeError(
@@ -613,6 +620,7 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
         "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
         "silence_rms": TRANSCRIPTION_SILENCE_RMS,
+        "use_vad": TRANSCRIPTION_USE_VAD,
     }
 
 
@@ -923,6 +931,41 @@ def _resolve_manifest_chunk(
     return resolved
 
 
+def _clear_srts_on_vad_flip(chunk_dir: Path, manifest: dict[str, object]) -> None:
+    """Delete chunk SRTs transcribed under the other VAD setting.
+
+    VAD on/off changes the SRT bytes themselves (concatenated-speech decode
+    versus wall-clock decode), so a chunk SRT produced under the flipped
+    setting is stale even though its audio is untouched. State files written
+    before the use_vad fingerprint key existed count as VAD-on, which was
+    the only behavior then.
+    """
+    if not manifest:
+        return
+    try:
+        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or not isinstance(state.get("fingerprint"), dict):
+        return
+    if state.get("fingerprint") == _retry_state_fingerprint(manifest):
+        return
+    if state["fingerprint"].get("use_vad", True) == bool(TRANSCRIPTION_USE_VAD):
+        return
+    removed = 0
+    for srt_path in sorted(chunk_dir.glob("*.srt")):
+        try:
+            srt_path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    print(
+        f"Transcription VAD setting changed; removed {removed} stale chunk SRT(s) "
+        "for re-transcription. Chunk audio is reused.",
+        flush=True,
+    )
+
+
 def transcribe_audio_in_chunks(
     audio_path: Path,
 ) -> Path:
@@ -938,6 +981,11 @@ def transcribe_audio_in_chunks(
         "all chunk audio is already prepared.",
         flush=True,
     )
+    print(
+        f"Whisper VAD pre-segmentation: {'ON' if TRANSCRIPTION_USE_VAD else 'OFF'} "
+        "(set TRANSCRIPTION_USE_VAD=1 for A/B comparison).",
+        flush=True,
+    )
     # The stitched SRT belongs to step 2's folder. When the mic wav lives in
     # step 1's folder (the RunAll layout), resolve the VOD root from it;
     # standalone/drag-drop runs keep the SRT next to the audio.
@@ -949,6 +997,7 @@ def transcribe_audio_in_chunks(
 
     chunk_dir = chunk_audio_paths[0].parent
     manifest = _read_retry_manifest(chunk_dir)
+    _clear_srts_on_vad_flip(chunk_dir, manifest)
     duration_ms = manifest.get("duration_ms")
     if not isinstance(duration_ms, int) or duration_ms <= 0:
         duration_ms = round(probe_audio_duration_seconds(audio_path) * 1_000)
@@ -1367,7 +1416,7 @@ if "%~1"=="" (
 set AUDIO=%~1
 
 echo Step 2a: running Whisper on each saved audio chunk...
-echo Whisper model and VAD settings are loaded from the organizer script.
+echo Whisper model settings are loaded from the organizer script.
 echo.
 python -u "{batch_quote(script_path)}" --transcribe-audio "%AUDIO%" --no-pause
 
