@@ -45,7 +45,6 @@ from pipeline_config import (
     TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_RETRY_MIN_MINUTES,
     TRANSCRIPTION_SILENCE_RMS,
-    TRANSCRIPTION_USE_VAD,
     VOCAL_ISOLATION_MODEL,
     ollama_base_url,
     ollama_is_reachable,
@@ -249,18 +248,9 @@ def _transcribe_audio_chunk(
         "--suppress-nst",
         "-t", "16",
     ]
-    if TRANSCRIPTION_USE_VAD:
-        # Opt-in only: VAD concatenates detected speech, decodes it as one
-        # contiguous buffer, then stretches the captions back across the
-        # excised silence, smearing timestamps over minutes of dead air.
-        command.extend([
-            "--vad",
-            "-vm", str(WHISPER_VAD),
-            "--vad-threshold", "0.42",
-            "--vad-min-silence-duration-ms", "500",
-            "--vad-max-speech-duration-s", "30",
-            "--vad-speech-pad-ms", "200",
-        ])
+    # No --vad: VAD concatenated detected speech and stretched captions back
+    # across the excised silence, smearing timestamps over minutes of dead
+    # air. Wall-clock decode is slower but stays true.
     result = subprocess.run(command)
     if result.returncode != 0:
         raise RuntimeError(
@@ -620,7 +610,11 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
         "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
         "silence_rms": TRANSCRIPTION_SILENCE_RMS,
-        "use_vad": TRANSCRIPTION_USE_VAD,
+        # One-way marker: every state written before the --vad removal lacks
+        # this key, so its fingerprint can never equal a post-removal one.
+        # Without it, a VAD-era state (same layout + knobs) would compare
+        # equal and its smeared SRTs would be silently reused.
+        "vad_removed": True,
     }
 
 
@@ -931,14 +925,15 @@ def _resolve_manifest_chunk(
     return resolved
 
 
-def _clear_srts_on_vad_flip(chunk_dir: Path, manifest: dict[str, object]) -> None:
-    """Delete chunk SRTs transcribed under the other VAD setting.
+def _clear_vad_era_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
+    """Delete chunk SRTs transcribed under the old always-on --vad.
 
-    VAD on/off changes the SRT bytes themselves (concatenated-speech decode
-    versus wall-clock decode), so a chunk SRT produced under the flipped
-    setting is stale even though its audio is untouched. State files written
-    before the use_vad fingerprint key existed count as VAD-on, which was
-    the only behavior then.
+    The VAD-era concatenated-speech decode produced smeared timestamps, so
+    any chunk SRT from before the removal is stale even though its audio is
+    untouched. Pre-removal fingerprints lack the vad_removed marker, so they
+    can never equal a post-removal one; that inequality alone identifies
+    them. Runs cleanly exactly once: after the first post-removal run saves
+    a fresh fingerprint, this is a no-op.
     """
     if not manifest:
         return
@@ -950,7 +945,7 @@ def _clear_srts_on_vad_flip(chunk_dir: Path, manifest: dict[str, object]) -> Non
         return
     if state.get("fingerprint") == _retry_state_fingerprint(manifest):
         return
-    if state["fingerprint"].get("use_vad", True) == bool(TRANSCRIPTION_USE_VAD):
+    if state["fingerprint"].get("vad_removed") is True:
         return
     removed = 0
     for srt_path in sorted(chunk_dir.glob("*.srt")):
@@ -960,8 +955,8 @@ def _clear_srts_on_vad_flip(chunk_dir: Path, manifest: dict[str, object]) -> Non
         except OSError:
             pass
     print(
-        f"Transcription VAD setting changed; removed {removed} stale chunk SRT(s) "
-        "for re-transcription. Chunk audio is reused.",
+        f"Old VAD-era transcription found; removed {removed} stale chunk SRT(s) "
+        "for wall-clock re-transcription. Chunk audio is reused.",
         flush=True,
     )
 
@@ -981,11 +976,6 @@ def transcribe_audio_in_chunks(
         "all chunk audio is already prepared.",
         flush=True,
     )
-    print(
-        f"Whisper VAD pre-segmentation: {'ON' if TRANSCRIPTION_USE_VAD else 'OFF'} "
-        "(set TRANSCRIPTION_USE_VAD=1 for A/B comparison).",
-        flush=True,
-    )
     # The stitched SRT belongs to step 2's folder. When the mic wav lives in
     # step 1's folder (the RunAll layout), resolve the VOD root from it;
     # standalone/drag-drop runs keep the SRT next to the audio.
@@ -997,7 +987,7 @@ def transcribe_audio_in_chunks(
 
     chunk_dir = chunk_audio_paths[0].parent
     manifest = _read_retry_manifest(chunk_dir)
-    _clear_srts_on_vad_flip(chunk_dir, manifest)
+    _clear_vad_era_srts(chunk_dir, manifest)
     duration_ms = manifest.get("duration_ms")
     if not isinstance(duration_ms, int) or duration_ms <= 0:
         duration_ms = round(probe_audio_duration_seconds(audio_path) * 1_000)

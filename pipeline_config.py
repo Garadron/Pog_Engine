@@ -153,13 +153,11 @@ LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 # suspect spans in transcription_warnings.json instead of hanging the run.
 # Empty chunk SRTs over near-silent audio (a muted mic) are accepted as-is;
 # only empty output over live audio re-enters the retry path.
-# whisper.cpp's --vad concatenates detected speech, decodes it as one
-# contiguous buffer, then stretches the captions back across the excised
-# silence: one caption per ~11 s compressed-speech span remaps onto minutes
-# of wall audio (267/471 chunk blocks >12 s on the sparse 09-12 VOD, worst
-# 346 s; VAD segments themselves never exceed ~10 s). The start times land
-# where the VAD says speech is, but the end times and merged sentences are
-# fiction, so VAD stays OFF by default. Re-enable only for A/B comparison.
+# VAD is gone: whisper.cpp's --vad concatenated detected speech, decoded it
+# as one contiguous buffer, then stretched the captions back across the
+# excised silence (one caption per ~11 s compressed-speech span remapped onto
+# minutes of wall audio; 267/471 chunk blocks >12 s on the sparse 09-12 VOD,
+# worst 346 s). Wall-clock decode is slower but timestamps stay true.
 TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
 TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
 TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)
@@ -167,7 +165,6 @@ TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS = _env_int("TRANSCRIPTION_LOOP_MIN_SPAN_SECO
 TRANSCRIPTION_RETRY_MIN_MINUTES = _env_int("TRANSCRIPTION_RETRY_MIN_MINUTES", 5)
 TRANSCRIPTION_RETRY_BUDGET_FACTOR = _env_float("TRANSCRIPTION_RETRY_BUDGET_FACTOR", 1.0)
 TRANSCRIPTION_SILENCE_RMS = _env_float("TRANSCRIPTION_SILENCE_RMS", 0.002)
-TRANSCRIPTION_USE_VAD = _env_bool("TRANSCRIPTION_USE_VAD", False)
 
 # --- Pipeline behavior -------------------------------------------------------
 # The RunAll GUI can optionally suspend Windows after every pipeline step
@@ -418,9 +415,6 @@ EDITABLE_PARAMS = [
     {"key": "TRANSCRIPTION_SILENCE_RMS", "env": "TRANSCRIPTION_SILENCE_RMS", "kind": "float", "stage": "Transcription",
      "label": "Silence RMS threshold (TRANSCRIPTION_SILENCE_RMS)",
      "help": "Empty chunk output under this audio RMS is a muted mic (accepted); empty output over louder audio is retried."},
-    {"key": "TRANSCRIPTION_USE_VAD", "env": "TRANSCRIPTION_USE_VAD", "kind": "bool", "stage": "Transcription",
-     "label": "Use whisper.cpp VAD pre-segmentation (TRANSCRIPTION_USE_VAD)",
-     "help": "OFF by default. VAD concatenates speech and stretches captions across excised silence, smearing timestamps over minutes of dead air on sparse VODs. Re-enable only for A/B comparison."},
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
      "label": "Discovery / audio-titling model (MODEL)",

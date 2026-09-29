@@ -1187,16 +1187,17 @@ captions claim speech (0.0 across 1:44-1:45); the VAD segment starts
 themselves land within 1 s of true speech, only the emitted spans are fiction.
 
 ### Fix
-New `TRANSCRIPTION_USE_VAD = _env_bool(..., False)` (`pipeline_config.py` +
-`EDITABLE_PARAMS` Transcription entry): `--vad` and its silero/threshold flags
-are appended only when ON; the Step 2 bat echo drops "and VAD"; the run prints
-`Whisper VAD pre-segmentation: ON/OFF`; `use_vad` joins the retry fingerprint
-so verdicts invalidate on flip, and `_clear_srts_on_vad_flip()` deletes chunk
-SRTs transcribed under the other setting (legacy state counts as VAD-on) while
-reusing chunk audio. Setup still downloads/patches `WHISPER_VAD` for A/B use.
-Script-only change: no bat regeneration, no checkpoint format change.
+`--vad` and its silero/threshold flags are deleted from
+`_transcribe_audio_chunk()` - wall-clock decode, no VAD pre-segmentation at
+all. The Step 2 bat echo drops "and VAD". `vad_removed: True` joins the retry
+fingerprint so VAD-era verdicts invalidate, and `_clear_vad_era_srts()`
+deletes chunk SRTs from before the removal (any stored fingerprint lacking
+the marker) while reusing chunk audio; after the first post-removal run it
+is a no-op. `WHISPER_VAD` stays downloaded/patched (harmless; `patch_paths()`
+warns instead of failing when a constant is absent, so its future removal
+needs no setup change). Script-only change: no bat regeneration, no
+checkpoint format change.
 
 ### Resume
 Re-run the VOD's `2_TranscribeAudio.bat` (Step 1 chunks reused; stale VAD-era
-chunk SRTs auto-cleared), then steps 3-5 normally. A/B via
-`set TRANSCRIPTION_USE_VAD=1` before the Step 2 bat.
+chunk SRTs auto-cleared), then steps 3-5 normally.
