@@ -77,7 +77,6 @@ GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 # Edit these if your whisper.cpp install moves.
 WHISPER_CLI = r"G:\pog_dev\models\Release\whisper-cli.exe"
 WHISPER_MODEL = r"G:\pog_dev\models\ggml-large-v3.bin"
-WHISPER_VAD = r"G:\pog_dev\models\ggml-silero-v6.2.0.bin"
 
 
 
@@ -3876,13 +3875,12 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 state["model"] = "Model: none"
 
         model_match = re.search(
-            r"(Model(?: metadata source)?|VAD model):\s*(.+)",
+            r"(?:^|(?<!VAD ))Model(?: metadata source)?:\s*(.+)",
             line,
             flags=re.IGNORECASE,
         )
         if model_match:
-            model_label, model_value = model_match.groups()
-            state["model"] = f"Loaded {model_label}: {model_value.strip()}"
+            state["model"] = f"Loaded Model: {model_match.group(1).strip()}"
 
         action_patterns = (
             r"^Step \d+/\d+:",
