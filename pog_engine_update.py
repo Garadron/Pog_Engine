@@ -13,7 +13,7 @@ files automatically:
    (EDITABLE_PARAMS defaults rewritten into pipeline_config.py) are carried
    from the old file into the new one via the new file's own
    apply_config_values(). New params keep new defaults; removed ones drop.
-2. Machine paths - WHISPER_CLI / WHISPER_MODEL / WHISPER_VAD / GALLERY_DIR /
+2. Machine paths - WHISPER_CLI / WHISPER_MODEL / GALLERY_DIR /
    EMOTION_LOCAL_MODEL_DIR / _FILE / TORCH_CACHE_DIR / HF_CACHE_DIR point at
    THIS machine's folders (rewritten by the installer). The old values are
    read from the backup and written into the new files, so a non-default
@@ -92,7 +92,6 @@ MANAGED_FILES = [
 PATH_CONSTANTS = [
     ("OrganizeVODAndFixSRT_Emotion.py", "WHISPER_CLI", False),
     ("OrganizeVODAndFixSRT_Emotion.py", "WHISPER_MODEL", False),
-    ("OrganizeVODAndFixSRT_Emotion.py", "WHISPER_VAD", False),
     ("OrganizeVODAndFixSRT_Emotion.py", "GALLERY_DIR", True),
     ("analyze_highlights_emotion.py", "EMOTION_LOCAL_MODEL_DIR", False),
     ("analyze_highlights_emotion.py", "EMOTION_LOCAL_MODEL_FILE", False),

@@ -7,7 +7,7 @@ sure some version of Python exists. It:
      files in the models folder, a whisper-cli.exe (whisper.cpp CUDA build),
      and ffmpeg/ffprobe on PATH.
   2. Patches the machine-specific path constants (WHISPER_CLI, WHISPER_MODEL,
-     WHISPER_VAD, GALLERY_DIR, EMOTION_LOCAL_MODEL_DIR/FILE) in the two
+     GALLERY_DIR, EMOTION_LOCAL_MODEL_DIR/FILE) in the two
      pipeline scripts to point at THIS machine's Pog_Engine folder, instead
      of whatever machine they were last edited on.
   3. Installs the Python packages the pipeline actually imports (requests,
@@ -199,7 +199,6 @@ REQUIRED_SCRIPTS = [
 
 REQUIRED_MODEL_FILES = [
     "ggml-large-v3.bin",
-    "ggml-silero-v6.2.0.bin",
     "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors",
     "config.json",
     "preprocessor_config.json",
@@ -505,15 +504,6 @@ def download_whisper_model(models_dir: Path, reporter: Reporter) -> bool:
     )
 
 
-def download_whisper_vad(models_dir: Path, reporter: Reporter) -> bool:
-    return download_file(
-        "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
-        models_dir / "ggml-silero-v6.2.0.bin",
-        reporter,
-        "Whisper VAD (ggml-silero-v6.2.0.bin)"
-    )
-
-
 def download_emotion_model_files(models_dir: Path, reporter: Reporter) -> bool:
     base = "https://huggingface.co/firdhokk/speech-emotion-recognition-with-openai-whisper-large-v3/resolve/main/"
     ok = True
@@ -614,7 +604,6 @@ def download_whisper_cpp_build(models_dir: Path, reporter: Reporter) -> bool:
 def download_all_models(models_dir: Path, reporter: Reporter) -> None:
     reporter.section("Downloading model files (skip-if-exists)")
     download_whisper_model(models_dir, reporter)
-    download_whisper_vad(models_dir, reporter)
     download_emotion_model_files(models_dir, reporter)
     download_whisper_cpp_build(models_dir, reporter)
 
@@ -800,7 +789,6 @@ def patch_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None,
 
     if organize_py.is_file():
         patch_raw_string_constant(organize_py, "WHISPER_MODEL", str(models_dir / "ggml-large-v3.bin"), False, reporter)
-        patch_raw_string_constant(organize_py, "WHISPER_VAD", str(models_dir / "ggml-silero-v6.2.0.bin"), False, reporter)
 
         gallery_dir = pog_dir / "gallery" / "best of"
         gallery_dir.mkdir(parents=True, exist_ok=True)
@@ -1448,7 +1436,6 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
         # so the constant could never match even after a successful download.
         expected_whisper_cli = str((models_dir / "Release" / "whisper-cli.exe").resolve())
     expected_whisper_model = str((models_dir / "ggml-large-v3.bin").resolve())
-    expected_whisper_vad = str((models_dir / "ggml-silero-v6.2.0.bin").resolve())
     expected_gallery_dir = str((pog_dir / "gallery" / "best of").resolve())
     expected_emotion_model_dir = str(models_dir.resolve())
     expected_emotion_model_file = str((models_dir / "speech-emotion-recognition-with-openai-whisper-large-v3.safetensors").resolve())
@@ -1470,7 +1457,6 @@ def check_config_paths(pog_dir: Path, models_dir: Path, whisper_cli: Path | None
         for var_name, expected in [
             ("WHISPER_CLI", expected_whisper_cli),
             ("WHISPER_MODEL", expected_whisper_model),
-            ("WHISPER_VAD", expected_whisper_vad),
             ("GALLERY_DIR", expected_gallery_dir),
         ]:
             if check_var(content, var_name, expected):
@@ -1841,7 +1827,7 @@ def run_gui(default_dir_str: str) -> int:
     add_row_widget("ffmpeg", "ffprobe", "ffprobe on PATH (VOD track-count detection)")
 
     config_frame = make_section("config", "Configuration (machine-specific paths)")
-    for var_name in ["WHISPER_CLI", "WHISPER_MODEL", "WHISPER_VAD", "GALLERY_DIR",
+    for var_name in ["WHISPER_CLI", "WHISPER_MODEL", "GALLERY_DIR",
                      "EMOTION_LOCAL_MODEL_DIR", "EMOTION_LOCAL_MODEL_FILE",
                      "TORCH_CACHE_DIR", "HF_CACHE_DIR"]:
         add_row_widget("config", var_name, var_name)

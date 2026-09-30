@@ -2172,6 +2172,34 @@ def run_judge_batch(pool, keep_n, judge_instructions, transcript_blocks_by_part=
 
     return ranked
 
+def _judge_halving_round(pool, judge_batch_size, judge_instructions,
+                         transcript_blocks_by_part, round_num):
+    """One halving round: each batch keeps its top half; falls back to score order."""
+    survivors = []
+    num_batches = (len(pool) + judge_batch_size - 1) // judge_batch_size
+    if round_num > 1:
+        print(f"     Judging round {round_num} in {num_batches} batch(es) of up to {judge_batch_size}...")
+
+    for batch_start in range(0, len(pool), judge_batch_size):
+        batch = pool[batch_start:batch_start + judge_batch_size]
+        keep_n = max(1, len(batch) // 2)
+
+        batch_ranked = run_judge_batch(
+            batch,
+            keep_n,
+            judge_instructions,
+            transcript_blocks_by_part,
+        )
+
+        if not batch_ranked:
+            # If a batch fails to parse, fall back to its
+            # top-scored candidates rather than losing the batch.
+            batch_ranked = sorted(batch, key=lambda x: x["Score"], reverse=True)[:keep_n]
+
+        survivors.extend(batch_ranked)
+
+    return survivors
+
 def run_judge_tournament(
     judge_pool,
     judge_instructions,
@@ -2179,7 +2207,7 @@ def run_judge_tournament(
     judge_batch_size=None,
     transcript_blocks_by_part=None,
 ):
-    """Rank candidates in one or two comparative judge rounds."""
+    """Rank candidates in one or more comparative halving rounds."""
     if judge_batch_size is None:
         judge_batch_size = JUDGE_BATCH_SIZE
 
@@ -2195,31 +2223,29 @@ def run_judge_tournament(
                 transcript_blocks_by_part,
             )
         else:
-            round1_survivors = []
             num_batches = (len(judge_pool) + judge_batch_size - 1) // judge_batch_size
             print(f"     Judging in {num_batches} batch(es) of up to {judge_batch_size}...")
-
-            for batch_start in range(0, len(judge_pool), judge_batch_size):
-                batch = judge_pool[batch_start:batch_start + judge_batch_size]
-                keep_n = max(1, len(batch) // 2)
-
-                batch_ranked = run_judge_batch(
-                    batch,
-                    keep_n,
-                    judge_instructions,
-                    transcript_blocks_by_part,
-                )
-
-                if not batch_ranked:
-                    # If a batch fails to parse, fall back to its
-                    # top-scored candidates rather than losing the batch.
-                    batch_ranked = sorted(batch, key=lambda x: x["Score"], reverse=True)[:keep_n]
-
-                round1_survivors.extend(batch_ranked)
+            round1_survivors = _judge_halving_round(
+                judge_pool, judge_batch_size, judge_instructions,
+                transcript_blocks_by_part, round_num=1,
+            )
 
             print(f"     Round 1 complete, {len(round1_survivors)} candidates advancing to final round")
+            # Extra halving rounds until the survivors fit one judge call.
+            # A single final call over all survivors exceeds JUDGE_NUM_CTX
+            # (50 survivors ~= 8900 prompt tokens vs 6144 on heavy presets),
+            # which fails deterministically - retries can never fix it.
+            survivors = round1_survivors
+            round_num = 2
+            while len(survivors) > judge_batch_size:
+                survivors = _judge_halving_round(
+                    survivors, judge_batch_size, judge_instructions,
+                    transcript_blocks_by_part, round_num=round_num,
+                )
+                round_num += 1
+
             ranked = run_judge_batch(
-                round1_survivors,
+                survivors,
                 top_n,
                 judge_instructions,
                 transcript_blocks_by_part,

@@ -153,6 +153,11 @@ LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 # suspect spans in transcription_warnings.json instead of hanging the run.
 # Empty chunk SRTs over near-silent audio (a muted mic) are accepted as-is;
 # only empty output over live audio re-enters the retry path.
+# VAD is gone: whisper.cpp's --vad concatenated detected speech, decoded it
+# as one contiguous buffer, then stretched the captions back across the
+# excised silence (one caption per ~11 s compressed-speech span remapped onto
+# minutes of wall audio; 267/471 chunk blocks >12 s on the sparse 09-12 VOD,
+# worst 346 s). Wall-clock decode is slower but timestamps stay true.
 TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
 TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
 TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)

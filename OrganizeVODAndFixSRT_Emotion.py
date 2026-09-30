@@ -62,6 +62,10 @@ TRANSCRIPT_MERGE_TARGET_WORDS = 30
 # A gap this long between captions is a new-thought boundary when merging
 # for LLM analysis, even before the target word count above is hit.
 TRANSCRIPT_MERGE_MAX_GAP_MS = 2500
+# Max audio time one merged thought may span (see merge_entries_for_analysis()).
+# Without this, sparse speech lets a block swallow minutes of audio while keeping
+# only its first caption's timestamp, so discovery quotes tail text at head time.
+TRANSCRIPT_MERGE_MAX_SPAN_MS = 30_000
 SCRIPT_DIR = Path(__file__).resolve().parent
 ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
 # Used only when count_audio_streams() below detects a single-track (Twitch-
@@ -73,7 +77,6 @@ GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 # Edit these if your whisper.cpp install moves.
 WHISPER_CLI = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\Release\whisper-cli.exe"
 WHISPER_MODEL = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\ggml-large-v3.bin"
-WHISPER_VAD = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\ggml-silero-v6.2.0.bin"
 
 
 
@@ -242,14 +245,11 @@ def _transcribe_audio_chunk(
         "--logprob-thold", "-0.8",
         "--no-speech-thold", "0.7",
         "--suppress-nst",
-        "--vad",
-        "-vm", str(WHISPER_VAD),
-        "--vad-threshold", "0.42",
-        "--vad-min-silence-duration-ms", "500",
-        "--vad-max-speech-duration-s", "30",
-        "--vad-speech-pad-ms", "200",
         "-t", "16",
     ]
+    # No --vad: VAD concatenated detected speech and stretched captions back
+    # across the excised silence, smearing timestamps over minutes of dead
+    # air. Wall-clock decode is slower but stays true.
     result = subprocess.run(command)
     if result.returncode != 0:
         raise RuntimeError(
@@ -609,6 +609,11 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
         "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
         "silence_rms": TRANSCRIPTION_SILENCE_RMS,
+        # One-way marker: every state written before the --vad removal lacks
+        # this key, so its fingerprint can never equal a post-removal one.
+        # Without it, a VAD-era state (same layout + knobs) would compare
+        # equal and its smeared SRTs would be silently reused.
+        "vad_removed": True,
     }
 
 
@@ -919,6 +924,42 @@ def _resolve_manifest_chunk(
     return resolved
 
 
+def _clear_vad_era_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
+    """Delete chunk SRTs transcribed under the old always-on --vad.
+
+    The VAD-era concatenated-speech decode produced smeared timestamps, so
+    any chunk SRT from before the removal is stale even though its audio is
+    untouched. Pre-removal fingerprints lack the vad_removed marker, so they
+    can never equal a post-removal one; that inequality alone identifies
+    them. Runs cleanly exactly once: after the first post-removal run saves
+    a fresh fingerprint, this is a no-op.
+    """
+    if not manifest:
+        return
+    try:
+        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or not isinstance(state.get("fingerprint"), dict):
+        return
+    if state.get("fingerprint") == _retry_state_fingerprint(manifest):
+        return
+    if state["fingerprint"].get("vad_removed") is True:
+        return
+    removed = 0
+    for srt_path in sorted(chunk_dir.glob("*.srt")):
+        try:
+            srt_path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    print(
+        f"Old VAD-era transcription found; removed {removed} stale chunk SRT(s) "
+        "for wall-clock re-transcription. Chunk audio is reused.",
+        flush=True,
+    )
+
+
 def transcribe_audio_in_chunks(
     audio_path: Path,
 ) -> Path:
@@ -945,6 +986,7 @@ def transcribe_audio_in_chunks(
 
     chunk_dir = chunk_audio_paths[0].parent
     manifest = _read_retry_manifest(chunk_dir)
+    _clear_vad_era_srts(chunk_dir, manifest)
     duration_ms = manifest.get("duration_ms")
     if not isinstance(duration_ms, int) or duration_ms <= 0:
         duration_ms = round(probe_audio_duration_seconds(audio_path) * 1_000)
@@ -1086,10 +1128,13 @@ def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, 
     analyze_highlights_emotion.py.
 
     A chunk closes (a new one starts) when adding the next caption would
-    push it past TRANSCRIPT_MERGE_TARGET_WORDS words, when there's a long
-    silence gap before the next caption (a natural pause = a natural new
-    thought), or once a sentence has just ended and the chunk already has
-    a reasonable amount of text - whichever comes first. Returns
+    push it past TRANSCRIPT_MERGE_TARGET_WORDS words, stretch its audio span
+    past TRANSCRIPT_MERGE_MAX_SPAN_MS, when there's a long silence gap before
+    the next caption (a natural pause = a natural new thought), or once a
+    sentence has just ended and the chunk already has a reasonable amount of
+    text - whichever comes first. Without the span cap, sparse speech lets one
+    chunk swallow minutes of audio while keeping only its first caption's
+    timestamp, so discovery quotes tail text at the head time. Returns
     (start_ms, text) tuples.
     """
     merged: list[tuple[int, str]] = []
@@ -1106,9 +1151,11 @@ def merge_entries_for_analysis(entries: list[SubtitleEntry]) -> list[tuple[int, 
         gap_ms = entry.start_ms - previous_end_ms if previous_end_ms is not None else 0
         ends_sentence = bool(buffer_words) and buffer_words[-1].rstrip("\"'").endswith((".", "!", "?"))
         would_exceed_target = bool(buffer_words) and len(buffer_words) + len(text.split()) > TRANSCRIPT_MERGE_TARGET_WORDS
+        span_ms = entry.start_ms - buffer_start_ms if buffer_words else 0
 
         should_close = buffer_words and (
             gap_ms > TRANSCRIPT_MERGE_MAX_GAP_MS
+            or span_ms > TRANSCRIPT_MERGE_MAX_SPAN_MS
             or would_exceed_target
             or (ends_sentence and len(buffer_words) >= MIN_SUBTITLE_WORDS)
         )
@@ -1358,7 +1405,7 @@ if "%~1"=="" (
 set AUDIO=%~1
 
 echo Step 2a: running Whisper on each saved audio chunk...
-echo Whisper model and VAD settings are loaded from the organizer script.
+echo Whisper model settings are loaded from the organizer script.
 echo.
 python -u "{batch_quote(script_path)}" --transcribe-audio "%AUDIO%" --no-pause
 
@@ -3828,13 +3875,12 @@ def run_all_gui(target_folder: Path, base_name: str) -> int:
                 state["model"] = "Model: none"
 
         model_match = re.search(
-            r"(Model(?: metadata source)?|VAD model):\s*(.+)",
+            r"(?:^|(?<!VAD ))Model(?: metadata source)?:\s*(.+)",
             line,
             flags=re.IGNORECASE,
         )
         if model_match:
-            model_label, model_value = model_match.groups()
-            state["model"] = f"Loaded {model_label}: {model_value.strip()}"
+            state["model"] = f"Loaded Model: {model_match.group(1).strip()}"
 
         action_patterns = (
             r"^Step \d+/\d+:",
