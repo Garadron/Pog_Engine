@@ -78,8 +78,8 @@ EMOTION_HALF_WINDOW_SECONDS = EMOTION_WINDOW_SECONDS / 2
 
 # Machine-specific paths - deliberately kept hardcoded here rather than in
 # pipeline_config.py. Edit these directly if your whisper-cublas install moves.
-EMOTION_LOCAL_MODEL_DIR = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models"
-EMOTION_LOCAL_MODEL_FILE = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"
+EMOTION_LOCAL_MODEL_DIR = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine_Garadron\models"
+EMOTION_LOCAL_MODEL_FILE = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine_Garadron\models\speech-emotion-recognition-with-openai-whisper-large-v3.safetensors"
 
 # Running totals for THIS PROCESS's Ollama usage (see ollama_generate()
 # below). Each stage merges its own contribution into the persistent
@@ -826,7 +826,11 @@ def find_source_video(stream_folder):
             candidates.append(os.path.join(stream_folder, name))
     if not candidates:
         return None
-    return max(candidates, key=os.path.getmtime)
+    # The organizer names the folder after the VOD, but other videos whose
+    # names share its prefix can land in the same folder: prefer the exact match.
+    folder_stem = os.path.basename(os.path.normpath(stream_folder)).lower()
+    exact = [p for p in candidates if os.path.splitext(os.path.basename(p))[0].lower() == folder_stem]
+    return max(exact or candidates, key=os.path.getmtime)
 
 def export_preview_clips(stream_folder, highlights, before_seconds, after_seconds):
     """Cuts a short clip around each final highlight into stream_folder/clips/

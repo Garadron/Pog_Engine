@@ -158,6 +158,17 @@ LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 # excised silence (one caption per ~11 s compressed-speech span remapped onto
 # minutes of wall audio; 267/471 chunk blocks >12 s on the sparse 09-12 VOD,
 # worst 346 s). Wall-clock decode is slower but timestamps stay true.
+# Language passed to whisper.cpp (-l). Use the audio's language code (en, it,
+# es, ...) or "auto" to let Whisper detect it per chunk. Forcing the wrong
+# language makes Whisper render speech as that language instead of
+# transcribing it, which also feeds every LLM stage a distorted transcript.
+TRANSCRIPTION_LANGUAGE = os.environ.get("TRANSCRIPTION_LANGUAGE", "it").strip().lower() or "en"
+# whisper.cpp -mc: how many tokens of already-transcribed text are fed back as
+# context. -1 keeps the full context, which lets a repetition loop propagate
+# from one segment to the next (on the 2026-09-30 VOD it left 37 minutes
+# untranscribed). 0 decodes every segment independently and ended the loops on
+# all four problem spans tested.
+TRANSCRIPTION_MAX_CONTEXT = _env_int("TRANSCRIPTION_MAX_CONTEXT", 0)
 TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
 TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
 TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)
@@ -256,6 +267,9 @@ EMOTION_BOOSTS = {
 # --- Hype phrase signal -------------------------------------------------------
 # Enter one phrase per line in the configurator. Matching is case-insensitive
 # substring matching within the configured window around each candidate.
+# The list mixes English and Italian phrases. Avoid very short words (they hit
+# inside other words: "gg" matches "oggi") and apostrophes (Whisper spells
+# them inconsistently).
 HYPE_PHRASES_ENABLED = _env_bool("HYPE_PHRASES_ENABLED", True)
 HYPE_PHRASE_WINDOW_SECONDS = _env_int("HYPE_PHRASE_WINDOW_SECONDS", 15)
 HYPE_PHRASE_BOOST = _env_float("HYPE_PHRASE_BOOST", 1.5)
@@ -297,6 +311,105 @@ DEFAULT_HYPE_PHRASES = [
     "what the fuck",
     "no way",
     "oh my god",
+    "clippa",
+    "clippate",
+    "fate la clip",
+    "fai la clip",
+    "qualcuno clippi",
+    "chat clippate",
+    "non ci credo",
+    "non è possibile",
+    "ma è possibile",
+    "è impossibile",
+    "ma scherzi",
+    "mi stai prendendo in giro",
+    "no vabb",
+    "no, vabb",
+    "sto male",
+    "mi sento male",
+    "pazzesco",
+    "pazzesca",
+    "assurdo",
+    "assurda",
+    "allucinante",
+    "incredibile",
+    "che follia",
+    "è una follia",
+    "follia pura",
+    "fuori di testa",
+    "che roba",
+    "che mostro",
+    "sei un mostro",
+    "sono un mostro",
+    "mostruoso",
+    "sono il migliore",
+    "sono un genio",
+    "che genio",
+    "sono fortissimo",
+    "troppo facile",
+    "facile facile",
+    "spaccato tutto",
+    "spacco tutto",
+    "li ho uccisi tutti",
+    "ho ucciso tutti",
+    "ho vinto",
+    "abbiamo vinto",
+    "che colpo",
+    "che botta",
+    "che giocata",
+    "che culo",
+    "che fortuna",
+    "che spettacolo",
+    "che bomba",
+    "boom",
+    "oddio",
+    "oh mio dio",
+    "dio mio",
+    "madonna santa",
+    "madonna mia",
+    "mamma mia",
+    "santo cielo",
+    "porca miseria",
+    "porca puttana",
+    "porca madonna",
+    "ma che cazzo",
+    "che cazzo è",
+    "oh cazzo",
+    "cazzo no",
+    "no no no no",
+    "sì sì sì sì",
+    "vai vai vai",
+    "aiuto",
+    "scappa",
+    "scappiamo",
+    "corri corri",
+    "è dietro di te",
+    "mi ha preso",
+    "mi hanno visto",
+    "mi hanno scoperto",
+    "sono morto",
+    "sono morta",
+    "sto morendo",
+    "muoio",
+    "ho paura",
+    "che paura",
+    "mi sono spaventato",
+    "mi sono spaventata",
+    "mi sono cagato",
+    "infarto",
+    "jumpscare",
+    "jump scare",
+    "sto piangendo",
+    "che ridere",
+    "da morire",
+    "non riesco a smettere",
+    "che scemo",
+    "che idiota",
+    "sono un idiota",
+    "che scarso",
+    "sono scarso",
+    "che vergogna",
+    "che imbarazzo",
 ]
 HYPE_PHRASES = _env_list("HYPE_PHRASES", DEFAULT_HYPE_PHRASES)
 
@@ -394,6 +507,12 @@ EDITABLE_PARAMS = [
      "label": "Seconds to wait before sleep",
      "help": "How long the RunAll GUI waits after the pipeline finishes before putting the PC to sleep. Any mouse movement or keystroke during the countdown cancels the sleep. Default: 30."},
     # --- Transcription ---
+    {"key": "TRANSCRIPTION_LANGUAGE", "env": "TRANSCRIPTION_LANGUAGE", "kind": "text", "stage": "Transcription",
+     "label": "Whisper language (TRANSCRIPTION_LANGUAGE)",
+     "help": "Language code of the audio (en, it, es, ...) or auto to detect per chunk. Must match what is spoken, otherwise Whisper outputs a distorted transcript. Changing it needs Step 2 re-run."},
+    {"key": "TRANSCRIPTION_MAX_CONTEXT", "env": "TRANSCRIPTION_MAX_CONTEXT", "kind": "int", "stage": "Transcription",
+     "label": "Whisper text context (TRANSCRIPTION_MAX_CONTEXT, tokens)",
+     "help": "Tokens of already-transcribed text fed back to Whisper (-mc). 0 = none, which prevents repetition loops from spreading between segments. -1 = full context (Whisper default, more coherent text but prone to loops). Changing it needs Step 2 re-run."},
     {"key": "TRANSCRIPTION_CHUNK_MINUTES", "env": "TRANSCRIPTION_CHUNK_MINUTES", "kind": "int", "stage": "Transcription",
      "label": "Whisper chunk length (minutes)",
      "help": "Each audio chunk starts a fresh Whisper decoder context. 30 minutes is a safe default for long VODs."},

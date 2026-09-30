@@ -846,7 +846,7 @@ def detect_cuda_driver_version() -> tuple[int, int] | None:
         return None
     if result.returncode != 0:
         return None
-    match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", result.stdout)
+    match = re.search(r"CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)", result.stdout)
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 

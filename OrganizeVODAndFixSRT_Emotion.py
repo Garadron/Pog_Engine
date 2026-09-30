@@ -40,7 +40,9 @@ from pipeline_config import (
     STEP_HISTORY_FILENAME,
     TRANSCRIPTION_CHUNK_MINUTES,
     TRANSCRIPTION_CHUNK_OVERLAP_SECONDS,
+    TRANSCRIPTION_LANGUAGE,
     TRANSCRIPTION_LOOP_MIN_REPEATS,
+    TRANSCRIPTION_MAX_CONTEXT,
     TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
     TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_RETRY_MIN_MINUTES,
@@ -71,12 +73,12 @@ ANALYZE_HIGHLIGHTS = SCRIPT_DIR / "analyze_highlights_emotion.py"
 # Used only when count_audio_streams() below detects a single-track (Twitch-
 # style) VOD - see make_extract_mic_bat_singletrack().
 ISOLATE_VOCALS_SCRIPT = SCRIPT_DIR / "isolate_vocals.py"
-GALLERY_DIR = Path(r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\gallery\best of")
+GALLERY_DIR = Path(r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine_Garadron\gallery\best of")
 GALLERY_IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 # Edit these if your whisper.cpp install moves.
-WHISPER_CLI = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\Release\whisper-cli.exe"
-WHISPER_MODEL = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine\models\ggml-large-v3.bin"
+WHISPER_CLI = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine_Garadron\models\Release\whisper-cli.exe"
+WHISPER_MODEL = r"D:\INTELLIGENZA_DELLA_MADONNA\Pog_Engine_Garadron\models\ggml-large-v3.bin"
 
 
 
@@ -235,10 +237,10 @@ def _transcribe_audio_chunk(
         str(WHISPER_CLI),
         "-m", str(WHISPER_MODEL),
         "-f", _cli_path(chunk_audio_path),
-        "-l", "en",
+        "-l", TRANSCRIPTION_LANGUAGE,
         "-osrt",
         "-of", _cli_path(chunk_srt_path.with_suffix("")),
-        "-mc", "-1",
+        "-mc", str(TRANSCRIPTION_MAX_CONTEXT),
         "--beam-size", "5",
         "--best-of", "5",
         "--entropy-thold", "2.6",

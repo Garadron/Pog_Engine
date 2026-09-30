@@ -1,0 +1,13 @@
+run_timestamp,run_id,stream_folder,step_number,step_label,status,started_at,finished_at,duration_seconds
+2026-09-30T21:41:26,20260930_213720_04f3924e,D:\YouTube\Live Gaming\The Last of Us Part I\1,1,1. Extract mic audio,Done,2026-09-30T21:37:21,2026-09-30T21:41:26,245.2
+2026-09-30T21:43:57,20260930_213720_04f3924e,D:\YouTube\Live Gaming\The Last of Us Part I\1,2,2. Transcribe audio,Stopped,2026-09-30T21:41:26,2026-09-30T21:43:57,151.0
+2026-09-30T21:48:23,20260930_214823_9a0f80df,D:\YouTube\Live Gaming\The Last of Us Part I\1,1,1. Extract mic audio,Skipped,2026-09-30T21:48:23,2026-09-30T21:48:23,245.2
+2026-09-30T22:10:08,20260930_214823_9a0f80df,D:\YouTube\Live Gaming\The Last of Us Part I\1,2,2. Transcribe audio,Done,2026-09-30T21:48:23,2026-09-30T22:10:08,1304.9
+2026-09-30T22:10:09,20260930_214823_9a0f80df,D:\YouTube\Live Gaming\The Last of Us Part I\1,3,3. Fix SRT,Done,2026-09-30T22:10:08,2026-09-30T22:10:09,0.4
+2026-09-30T22:10:09,20260930_214823_9a0f80df,D:\YouTube\Live Gaming\The Last of Us Part I\1,4,4. Split SRT,Done,2026-09-30T22:10:09,2026-09-30T22:10:09,0.3
+2026-09-30T22:17:57,20260930_214823_9a0f80df,D:\YouTube\Live Gaming\The Last of Us Part I\1,5,5. Analyze highlights,Done,2026-09-30T22:10:09,2026-09-30T22:17:57,468.4
+2026-09-30T22:39:56,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,1,1. Extract mic audio,Skipped,2026-09-30T22:39:56,2026-09-30T22:39:56,245.2
+2026-09-30T22:46:16,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,2,2. Transcribe audio,Done,2026-09-30T22:39:56,2026-09-30T22:46:16,380.3
+2026-09-30T22:46:16,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,3,3. Fix SRT,Done,2026-09-30T22:46:16,2026-09-30T22:46:16,0.3
+2026-09-30T22:46:16,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,4,4. Split SRT,Done,2026-09-30T22:46:16,2026-09-30T22:46:16,0.3
+2026-09-30T22:53:50,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,5,5. Analyze highlights,Done,2026-09-30T22:46:16,2026-09-30T22:53:50,453.9
