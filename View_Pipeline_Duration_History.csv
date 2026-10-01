@@ -11,3 +11,8 @@ run_timestamp,run_id,stream_folder,step_number,step_label,status,started_at,fini
 2026-09-30T22:46:16,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,3,3. Fix SRT,Done,2026-09-30T22:46:16,2026-09-30T22:46:16,0.3
 2026-09-30T22:46:16,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,4,4. Split SRT,Done,2026-09-30T22:46:16,2026-09-30T22:46:16,0.3
 2026-09-30T22:53:50,20260930_223955_a5a5c386,D:\YouTube\Live Gaming\The Last of Us Part I\1,5,5. Analyze highlights,Done,2026-09-30T22:46:16,2026-09-30T22:53:50,453.9
+2026-10-01T00:47:14,20261001_004704_fa3be15d,D:\YouTube\Video OBS\Nuova cartella\2026-09-30 23-22-24,1,1. Extract mic audio,Done,2026-10-01T00:47:04,2026-10-01T00:47:14,10.0
+2026-10-01T00:50:12,20261001_004704_fa3be15d,D:\YouTube\Video OBS\Nuova cartella\2026-09-30 23-22-24,2,2. Transcribe audio,Done,2026-10-01T00:47:14,2026-10-01T00:50:12,177.6
+2026-10-01T00:50:12,20261001_004704_fa3be15d,D:\YouTube\Video OBS\Nuova cartella\2026-09-30 23-22-24,3,3. Fix SRT,Done,2026-10-01T00:50:12,2026-10-01T00:50:12,0.3
+2026-10-01T00:50:12,20261001_004704_fa3be15d,D:\YouTube\Video OBS\Nuova cartella\2026-09-30 23-22-24,4,4. Split SRT,Done,2026-10-01T00:50:12,2026-10-01T00:50:12,0.3
+2026-10-01T00:56:15,20261001_004704_fa3be15d,D:\YouTube\Video OBS\Nuova cartella\2026-09-30 23-22-24,5,5. Analyze highlights,Done,2026-10-01T00:50:12,2026-10-01T00:56:15,362.5

@@ -55,7 +55,7 @@ from pipeline_config import (
     EMOTION_MODEL_INPUT_SECONDS, EMOTION_CONFIDENCE_FLOOR, EMOTION_MAX_CANDIDATES,
     EMOTION_BATCH_SIZE, EMOTION_USE_FP16, EMOTION_ENABLED, EMOTION_BOOSTS,
     HYPE_PHRASES_ENABLED, HYPE_PHRASE_WINDOW_SECONDS, HYPE_PHRASE_BOOST,
-    HYPE_PHRASE_MIN_MATCHES, HYPE_PHRASES,
+    HYPE_PHRASE_MIN_MATCHES, HYPE_PHRASES, HIGHLIGHT_OUTPUT_LANGUAGE,
     AUDIO_SCAN_ENABLED, AUDIO_SCAN_HOP_SECONDS,
     AUDIO_SCAN_MIN_SEPARATION_SECONDS, AUDIO_SCAN_MIN_ZSCORE, AUDIO_SCAN_MAX_CANDIDATES,
     AUDIO_SCAN_SKIP_NEAR_EXISTING_SECONDS, AUDIO_SCAN_LOUDNESS_WEIGHT,
@@ -1510,8 +1510,7 @@ STRICT OUTPUT FORMAT:
 - Exactly 3 comma-separated fields per line: ItemNumber,"Title","Reason"
 - Wrap Title and Reason in double quotes since they may contain commas
 - No extra commentary, headers, or explanation - CSV rows only
-
-"""
+""" + OUTPUT_LANGUAGE_RULE + "\n"
 
     for batch_start in range(0, len(raw_candidates), AUDIO_SCAN_TITLE_BATCH_SIZE):
         batch = raw_candidates[batch_start:batch_start + AUDIO_SCAN_TITLE_BATCH_SIZE]
@@ -2643,6 +2642,12 @@ STRICT OUTPUT FORMAT:
 - Wrap Title and Reason in double quotes since they may contain commas
 - Do not add any extra commentary, headers, or explanation - CSV rows only
 """
+OUTPUT_LANGUAGE_RULE = (
+    f"- Write every Title and Reason in {HIGHLIGHT_OUTPUT_LANGUAGE}; keep timestamps,\n"
+    "  numbers and the CSV structure exactly as specified\n"
+    if HIGHLIGHT_OUTPUT_LANGUAGE else ""
+)
+DISCOVERY_COMMON_FORMAT += OUTPUT_LANGUAGE_RULE
 
 DISCOVERY_COMMON_SCORING = """\
 Use the FULL 1-10 range, but be harsh. Most valid moments should land in

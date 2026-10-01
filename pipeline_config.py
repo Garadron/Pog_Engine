@@ -187,6 +187,10 @@ AUTO_SLEEP_AFTER_PIPELINE = _env_bool("AUTO_SLEEP_AFTER_PIPELINE", False)
 # entirely (the PC stays awake and the GUI returns to its normal Done state).
 # Only used when AUTO_SLEEP_AFTER_PIPELINE is enabled; default 30 seconds.
 AUTO_SLEEP_DELAY_SECONDS = _env_int("AUTO_SLEEP_DELAY_SECONDS", 30)
+# Language of the Title and Reason the LLM writes (CSV, EDL markers, Premiere
+# XML). The prompts are English, so without this the model answers in English
+# even on an Italian transcript. Empty keeps the model's default.
+HIGHLIGHT_OUTPUT_LANGUAGE = os.environ.get("HIGHLIGHT_OUTPUT_LANGUAGE", "Italian").strip()
 
 
 # --- Output size / selection ------------------------------------------------
@@ -506,6 +510,9 @@ EDITABLE_PARAMS = [
     {"key": "AUTO_SLEEP_DELAY_SECONDS", "env": "AUTO_SLEEP_DELAY_SECONDS", "kind": "int", "stage": "General",
      "label": "Seconds to wait before sleep",
      "help": "How long the RunAll GUI waits after the pipeline finishes before putting the PC to sleep. Any mouse movement or keystroke during the countdown cancels the sleep. Default: 30."},
+    {"key": "HIGHLIGHT_OUTPUT_LANGUAGE", "env": "HIGHLIGHT_OUTPUT_LANGUAGE", "kind": "text", "stage": "General",
+     "label": "Highlight titles language (HIGHLIGHT_OUTPUT_LANGUAGE)",
+     "help": "Language for the Title and Reason the AI writes, in English words (e.g. Italian, Spanish). Empty = model default (English). Re-run Step 5 from discovery to apply it to an analyzed VOD."},
     # --- Transcription ---
     {"key": "TRANSCRIPTION_LANGUAGE", "env": "TRANSCRIPTION_LANGUAGE", "kind": "text", "stage": "Transcription",
      "label": "Whisper language (TRANSCRIPTION_LANGUAGE)",
