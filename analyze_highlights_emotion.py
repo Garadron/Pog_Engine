@@ -38,6 +38,7 @@ import bisect
 import difflib
 import io
 import argparse
+import wave
 from datetime import datetime
 from pathlib import Path
 from pipeline_config import (
@@ -48,7 +49,7 @@ from pipeline_config import (
     LLAMA_JUDGE_MODEL_PATH, LLAMA_CONTEXT_SIZE,
     OLLAMA_RETRIES, OLLAMA_RETRY_BACKOFF_SECONDS,
     model_memory_fit,
-    TOP_N, JUDGE_POOL_SIZE, VERIFY_POOL_SIZE, VERIFY_BATCH_SIZE, VERIFY_MIN_COVERAGE_RATIO,
+    TOP_N, HIGHLIGHTS_PER_HOUR, JUDGE_POOL_SIZE, VERIFY_POOL_SIZE, VERIFY_BATCH_SIZE, VERIFY_MIN_COVERAGE_RATIO,
     VERIFY_NUM_PREDICT, JUDGE_BATCH_SIZE,
     TIMESTAMP_TOLERANCE_SECONDS,
     EMOTION_MODEL_ID, EMOTION_SCORES_CSV, EMOTION_WINDOW_SECONDS,
@@ -816,6 +817,36 @@ def find_mic_wav(stream_folder):
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+def stream_hours(stream_folder):
+    """Length of the stream from the mic WAV header (0 when it can't be read)."""
+    mic = find_mic_wav(stream_folder)
+    if mic is None:
+        return 0.0
+    try:
+        with wave.open(str(mic), "rb") as w:
+            return w.getnframes() / float(w.getframerate()) / 3600
+    except (OSError, wave.Error):
+        return 0.0
+
+def selection_limits(stream_folder):
+    """Candidate/output sizes for this stream. The config values are the
+    minimum; HIGHLIGHTS_PER_HOUR raises TOP_N on long streams and every other
+    cap scales by the same factor, so a 9-hour stream isn't squeezed into the
+    same 50 highlights as a 2-hour one."""
+    hours = stream_hours(stream_folder)
+    top_n = TOP_N
+    if HIGHLIGHTS_PER_HOUR > 0 and hours > 0:
+        top_n = max(TOP_N, round(hours * HIGHLIGHTS_PER_HOUR))
+    factor = top_n / TOP_N if TOP_N else 1.0
+    return {
+        "hours": hours,
+        "top_n": top_n,
+        "judge_pool": max(JUDGE_POOL_SIZE, round(JUDGE_POOL_SIZE * factor)),
+        "verify_pool": max(VERIFY_POOL_SIZE, round(VERIFY_POOL_SIZE * factor)),
+        "audio_scan_max": max(AUDIO_SCAN_MAX_CANDIDATES, round(AUDIO_SCAN_MAX_CANDIDATES * factor)),
+        "emotion_max": max(EMOTION_MAX_CANDIDATES, round(EMOTION_MAX_CANDIDATES * factor)),
+    }
+
 def find_source_video(stream_folder):
     """Find the original recording (mp4/mkv/mov) that step 0 moved into this
     folder, so preview clips can be cut with picture, not just the extracted
@@ -1023,9 +1054,10 @@ def classify_candidate_emotions(stream_folder, highlights):
         return {}
 
     timestamps = sorted({h["Timestamp"] for h in highlights}, key=timestamp_to_seconds)
-    if len(timestamps) > EMOTION_MAX_CANDIDATES:
+    emotion_max = selection_limits(stream_folder)["emotion_max"]
+    if len(timestamps) > emotion_max:
         ranked = sorted(highlights, key=lambda h: h["Score"], reverse=True)
-        timestamps = sorted({h["Timestamp"] for h in ranked[:EMOTION_MAX_CANDIDATES]}, key=timestamp_to_seconds)
+        timestamps = sorted({h["Timestamp"] for h in ranked[:emotion_max]}, key=timestamp_to_seconds)
         print(f"[emotion] Limiting scoring to top {len(timestamps)} candidate timestamps.")
 
     labels = [model.config.id2label.get(index, model.config.id2label.get(str(index), str(index))) for index in range(len(model.config.id2label))]
@@ -1636,11 +1668,12 @@ def find_audio_scan_candidates(stream_folder, highlights, transcript_blocks_by_p
 
     times, composite, loudness_z, rate_z = compute_audio_arousal_series(audio, sample_rate)
 
+    audio_scan_max = selection_limits(stream_folder)["audio_scan_max"]
     peak_indices = pick_energy_peaks(
         times, composite,
         min_zscore=AUDIO_SCAN_MIN_ZSCORE,
         min_separation_seconds=AUDIO_SCAN_MIN_SEPARATION_SECONDS,
-        max_candidates=AUDIO_SCAN_MAX_CANDIDATES * 3,  # generous pre-filter, trimmed below
+        max_candidates=audio_scan_max * 3,  # generous pre-filter, trimmed below
     )
     AUDIO_SCAN_STATS["candidates_found"] = len(peak_indices)
     print(f"[audio-scan] {len(peak_indices)} energy peak(s) found before de-duplication against existing candidates")
@@ -1664,7 +1697,7 @@ def find_audio_scan_candidates(stream_folder, highlights, transcript_blocks_by_p
             "Score": audio_candidate_base_score(lz, rz),
             "SourcePart": part_for_timestamp(t, part_ranges),
         })
-        if len(raw_candidates) >= AUDIO_SCAN_MAX_CANDIDATES:
+        if len(raw_candidates) >= audio_scan_max:
             break
 
     AUDIO_SCAN_STATS["candidates_kept"] = len(raw_candidates)
@@ -2525,6 +2558,7 @@ def write_run_info(stream_folder, final_highlights):
     """Snapshots the models/settings used and the accumulated pipeline
     stats (Ollama calls, per-stage timing) into run_info.json."""
     stats = load_pipeline_stats(stream_folder)
+    limits = selection_limits(stream_folder)
     run_info = {
         "run_timestamp": datetime.now().isoformat(timespec="seconds"),
         "stream_folder": stream_folder,
@@ -2532,9 +2566,13 @@ def write_run_info(stream_folder, final_highlights):
         "judge_model": JUDGE_MODEL,
         "discovery_num_ctx": DISCOVERY_NUM_CTX,
         "judge_num_ctx": JUDGE_NUM_CTX,
-        "top_n": TOP_N,
-        "judge_pool_size": JUDGE_POOL_SIZE,
-        "verify_pool_size": VERIFY_POOL_SIZE,
+        "stream_hours": round(limits["hours"], 2),
+        "highlights_per_hour": HIGHLIGHTS_PER_HOUR,
+        "top_n": limits["top_n"],
+        "judge_pool_size": limits["judge_pool"],
+        "verify_pool_size": limits["verify_pool"],
+        "audio_scan_max_candidates": limits["audio_scan_max"],
+        "emotion_max_candidates": limits["emotion_max"],
         "timestamp_tolerance_seconds": TIMESTAMP_TOLERANCE_SECONDS,
         "emotion_enabled": EMOTION_ENABLED,
         "emotion_boosts": EMOTION_BOOSTS,
@@ -3058,7 +3096,7 @@ def run_stage_verify(stream_folder):
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["emotion"], stage)
 
         before_trim = len(highlights)
-        highlights = highlights[:VERIFY_POOL_SIZE]
+        highlights = highlights[:selection_limits(stream_folder)["verify_pool"]]
         if before_trim > len(highlights):
             print(f"Trimmed {before_trim - len(highlights)} low-scoring candidate(s) before verification")
 
@@ -3102,13 +3140,15 @@ def run_stage_judge(stream_folder):
         highlights = require_checkpoint(stream_folder, STAGE_CHECKPOINT_NAMES["verify"], stage)
         transcript_blocks_by_part = build_transcript_blocks_by_part(stream_folder)
 
-        judge_pool = highlights[:JUDGE_POOL_SIZE]
-        print(f"Running judge stage with {len(judge_pool)} candidates...")
+        limits = selection_limits(stream_folder)
+        judge_pool = highlights[:limits["judge_pool"]]
+        print(f"Running judge stage with {len(judge_pool)} candidates for {limits['top_n']} highlights "
+              f"({limits['hours']:.1f} h of stream)...")
 
         ranked = run_judge_tournament(
             judge_pool,
             JUDGE_INSTRUCTIONS,
-            TOP_N,
+            limits["top_n"],
             transcript_blocks_by_part=transcript_blocks_by_part,
         )
 
@@ -3134,9 +3174,10 @@ def run_stage_export(stream_folder):
 
         calibrate_final_scores_by_rank(final_highlights)
 
-        csv_path = write_highlights_csv(stream_folder, final_highlights, TOP_N)
-        edl_path = write_highlights_edl(stream_folder, final_highlights, TOP_N)
-        premiere_xml_path = write_highlights_premiere_xml(stream_folder, final_highlights, TOP_N)
+        top_n = selection_limits(stream_folder)["top_n"]
+        csv_path = write_highlights_csv(stream_folder, final_highlights, top_n)
+        edl_path = write_highlights_edl(stream_folder, final_highlights, top_n)
+        premiere_xml_path = write_highlights_premiere_xml(stream_folder, final_highlights, top_n)
 
         if EXPORT_PREVIEW_CLIPS:
             export_preview_clips(stream_folder, final_highlights, PREVIEW_CLIP_SECONDS_BEFORE, PREVIEW_CLIP_SECONDS_AFTER)
@@ -3145,7 +3186,7 @@ def run_stage_export(stream_folder):
         write_run_info(stream_folder, final_highlights)
 
         print("=" * 60)
-        print(f"Top {TOP_N} highlights saved:")
+        print(f"Top {top_n} highlights saved:")
         print(csv_path)
         print(edl_path)
         print(premiere_xml_path)

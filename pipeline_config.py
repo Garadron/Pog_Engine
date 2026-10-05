@@ -195,6 +195,11 @@ HIGHLIGHT_OUTPUT_LANGUAGE = os.environ.get("HIGHLIGHT_OUTPUT_LANGUAGE", "Italian
 
 # --- Output size / selection ------------------------------------------------
 TOP_N = _env_int("HIGHLIGHT_TOP_N", 50)
+# Long streams hold more moments than short ones: TOP_N is the minimum, raised
+# to HIGHLIGHTS_PER_HOUR x stream hours, and the verify/judge pools and the
+# audio-scan/emotion caps grow by the same factor (see selection_limits() in
+# analyze_highlights_emotion.py). 0 keeps the fixed sizes below.
+HIGHLIGHTS_PER_HOUR = _env_float("HIGHLIGHTS_PER_HOUR", 15.0)
 JUDGE_POOL_SIZE = _env_int("HIGHLIGHT_JUDGE_POOL_SIZE", 100)
 # Trimmed to this size before verification, not after - only JUDGE_POOL_SIZE
 # ever reach judging, so verifying much more than that wastes LLM calls on
@@ -573,7 +578,10 @@ EDITABLE_PARAMS = [
     # --- Selection / counts ---
     {"key": "TOP_N",            "env": "HIGHLIGHT_TOP_N",           "kind": "int",   "stage": "Selection",
      "label": "Final highlights to export (TOP_N)",
-     "help": "Number of rows in the CSV and markers in the EDL."},
+     "help": "Number of rows in the CSV and markers in the EDL. With HIGHLIGHTS_PER_HOUR above 0 this is the minimum for short streams."},
+    {"key": "HIGHLIGHTS_PER_HOUR", "env": "HIGHLIGHTS_PER_HOUR",   "kind": "float", "stage": "Selection",
+     "label": "Highlights per stream hour (HIGHLIGHTS_PER_HOUR)",
+     "help": "Raises TOP_N to this x stream hours on long streams; verify/judge pools and audio-scan/emotion caps scale with it. 0 = fixed sizes."},
     {"key": "JUDGE_POOL_SIZE",  "env": "HIGHLIGHT_JUDGE_POOL_SIZE",  "kind": "int",   "stage": "Selection",
      "label": "Judge pool size (JUDGE_POOL_SIZE)",
      "help": "Only this many top-scored candidates reach the judge. Larger = more judging calls."},
