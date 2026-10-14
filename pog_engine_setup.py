@@ -1590,6 +1590,8 @@ def _verify_python_packages(models_dir: Path, reporter: Reporter,
             reporter.status(pip_name, "Missing")
             all_ok = False
 
+    return all_ok and demucs_model_ok
+
 
 def check_python_packages(models_dir: Path, reporter: Reporter, install: bool) -> bool:
     """Install packages when requested, then verify what's importable."""
