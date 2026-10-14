@@ -41,8 +41,11 @@ from pipeline_config import (
     TRANSCRIPTION_CHUNK_MINUTES,
     TRANSCRIPTION_CHUNK_OVERLAP_SECONDS,
     TRANSCRIPTION_LOOP_MIN_REPEATS,
+    TRANSCRIPTION_MAX_CONTEXT,
     TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
     TRANSCRIPTION_LOOP_BURST_REPEATS,
+    TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS,
+    TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT,
     TRANSCRIPTION_RETRY_MIN_MINUTES,
     TRANSCRIPTION_RETRY_BUDGET_FACTOR,
     TRANSCRIPTION_SILENCE_RMS,
@@ -243,7 +246,7 @@ def _transcribe_audio_chunk(
         "-l", "en",
         "-osrt",
         "-of", _cli_path(chunk_srt_path.with_suffix("")),
-        "-mc", "-1",
+        "-mc", str(TRANSCRIPTION_MAX_CONTEXT),
         "--temperature", "0",
         "--beam-size", "5",
         "--best-of", "1",
@@ -254,6 +257,11 @@ def _transcribe_audio_chunk(
         "-fa",
         "-t", "8",
     ]
+    # -mc 0 (TRANSCRIPTION_MAX_CONTEXT): whisper.cpp's default carries all
+    # previous-window text into the next window's prompt, and on sparse
+    # speech over dead air the decoder then repeats its own last caption
+    # once per window for minutes (the transcript hole IS the loop; the
+    # speech under it is never decoded). See pipeline_config.py.
     # No --vad: VAD concatenated detected speech and stretched captions back
     # across the excised silence, smearing timestamps over minutes of dead
     # air. Wall-clock decode is slower but stays true. No --no-fallback
@@ -309,10 +317,77 @@ def _read_transcription_chunk(
     return entries
 
 
+def _load_rms_blocks(audio_path: Path) -> list[float] | None:
+    """1 s-block RMS (0..1) of a 16-bit PCM WAV; None when unreadable.
+
+    Streams the file in 2-minute reads so a 5 h mic WAV (~600 MB) never sits
+    in memory whole."""
+    try:
+        import numpy as np
+        import wave
+        blocks: list[float] = []
+        with wave.open(str(audio_path), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                return None
+            rate = wav.getframerate()
+            channels = wav.getnchannels()
+            while True:
+                raw = wav.readframes(rate * 120)
+                if not raw:
+                    break
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if channels > 1:
+                    samples = samples.reshape(-1, channels).mean(axis=1)
+                whole = samples.size // rate
+                if whole:
+                    blocks.extend(
+                        np.sqrt((samples[:whole * rate].reshape(whole, rate) ** 2).mean(axis=1)).tolist()
+                    )
+                if samples.size % rate:
+                    blocks.append(float((samples[whole * rate:] ** 2).mean() ** 0.5))
+        return blocks
+    except (ImportError, OSError, EOFError, ValueError):
+        return None
+
+
+def drop_silent_captions(
+    entries: list[tuple[int, int, str, int]],
+    audio_path: Path,
+) -> tuple[list[tuple[int, int, str, int]], list[dict[str, object]]]:
+    """Drop captions whose whole span (+-1 s) is digital silence.
+
+    The mic WAV is noise-gated, so dead air reads as exact zero. Whatever
+    Whisper prints over it ("Thank you.", "Subtitles by the Amara.org
+    community") is invented. Threshold is TRANSCRIPTION_SILENCE_RMS (the
+    muted-mic definition used everywhere else); on the 09-24/09-25 looped
+    chunks it dropped 16 of 576 captions, all hallucinations, none real.
+    Unreadable audio keeps everything. Returns (kept, dropped-records).
+    """
+    blocks = _load_rms_blocks(audio_path)
+    if blocks is None:
+        return entries, []
+    kept: list[tuple[int, int, str, int]] = []
+    dropped: list[dict[str, object]] = []
+    for entry in entries:
+        start_ms, end_ms, text, _chunk_index = entry
+        first = max(0, start_ms // 1_000 - 1)
+        last = min(len(blocks) - 1, end_ms // 1_000 + 1)
+        peak = max(blocks[first:last + 1], default=None)
+        if peak is not None and peak < TRANSCRIPTION_SILENCE_RMS:
+            dropped.append({
+                "start_ms": start_ms, "end_ms": end_ms, "text": text, "peak_rms": round(peak, 5),
+            })
+        else:
+            kept.append(entry)
+    return kept, dropped
+
+
 def stitch_transcription_chunks(
     chunk_srt_paths: list[Path],
     chunk_offsets_ms: list[int],
     output_path: Path,
+    audio_path: Path | None = None,
+    warnings: list[dict[str, object]] | None = None,
 ) -> Path:
     """Shift each chunk into the full-audio clock before writing one SRT."""
     if len(chunk_srt_paths) != len(chunk_offsets_ms):
@@ -326,6 +401,21 @@ def stitch_transcription_chunks(
     ):
         entries.extend(_read_transcription_chunk(chunk_path, offset_ms, chunk_index))
     entries.sort(key=lambda item: (item[0], item[1], item[3]))
+    if audio_path is not None:
+        entries, silent_dropped = drop_silent_captions(entries, audio_path)
+        if silent_dropped:
+            print(
+                f"Dropped {len(silent_dropped)} caption(s) printed over digital silence "
+                f"(peak RMS < {TRANSCRIPTION_SILENCE_RMS}); recorded in transcription_warnings.json.",
+                flush=True,
+            )
+            if warnings is not None:
+                warnings.append({
+                    "chunk": "all",
+                    "kind": "silent-captions-dropped",
+                    "detail": f"{len(silent_dropped)} caption(s) over silent audio removed.",
+                    "captions": silent_dropped,
+                })
 
     overlap_ms = TRANSCRIPTION_CHUNK_OVERLAP_SECONDS * 1_000
     deduped: list[list[int | str]] = []
@@ -634,67 +724,90 @@ def detect_transcription_loop(
     for start_ms, end_ms, text, _key in entries:
         if _block_intra_repeat_ratio(text) >= 0.5:
             return (start_ms, 1, end_ms - start_ms, text)
-    best: tuple[int, int, int, str] | None = None
-    current_key: str | None = None
-    current_start = 0
-    current_end = 0
-    current_length = 0
-    current_text = ""
+    # Every offending shape is collected and the widest by span wins. Gating
+    # only the single longest run (the old behavior) let a fast, harmless
+    # run (23x over 89 s, under the burst gate) shadow the real 18x over
+    # 359 s loop in the same chunk, and skipping the alternation scan
+    # whenever any run reached 6 let an 18x/18 s run hide 700 alternating
+    # captions (09-24 VOD chunks 3 and 6, 2026-10-14).
+    candidates: list[tuple[int, int, int, str]] = []
 
-    def consider() -> None:
-        nonlocal best
-        if current_key is None or current_length <= 0:
-            return
-        span_ms = current_end - current_start
-        if best is None or (current_length, span_ms) > (best[1], best[2]):
-            best = (current_start, current_length, span_ms, current_text)
+    run_start = 0
+    while run_start < len(entries):
+        run_end = run_start
+        while run_end + 1 < len(entries) and entries[run_end + 1][3] == entries[run_start][3]:
+            run_end += 1
+        length = run_end - run_start + 1
+        span_ms = entries[run_end][1] - entries[run_start][0]
+        if (
+            (length >= TRANSCRIPTION_LOOP_MIN_REPEATS
+             and span_ms >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000)
+            or length >= TRANSCRIPTION_LOOP_BURST_REPEATS
+        ):
+            candidates.append((entries[run_start][0], length, span_ms, entries[run_start][2]))
+        run_start = run_end + 1
 
-    for start_ms, end_ms, text, key in entries:
-        if key == current_key:
-            current_length += 1
-            current_end = end_ms
+    # A-B-A-B alternation: the exact-run scan never exceeds length 1 there.
+    # A window of 8 blocks over <= 2 fuzzy-distinct captions in strict
+    # alternation is a loop (real dialogue alternates speakers, not
+    # identical sentences). A hit extends to the end of the alternation so
+    # the reported span is the loop's true width.
+    window = 8
+    index = 0
+    while index + window <= len(entries):
+        window_entries = entries[index:index + window]
+        distinct: list[str] = []
+        for _start_ms, _end_ms, _text, key in window_entries:
+            if not any(_captions_are_near_identical(key, seen) for seen in distinct):
+                distinct.append(key)
+                if len(distinct) > 2:
+                    break
+        if len(distinct) <= 2 and (
+            len({window_entries[i][3] for i in range(0, window, 2)}) == 1
+            and len({window_entries[i][3] for i in range(1, window, 2)}) == 1
+            and window_entries[0][3] != window_entries[1][3]
+        ):
+            key_a, key_b = window_entries[0][3], window_entries[1][3]
+            last = index + window - 1
+            while (
+                last + 1 < len(entries)
+                and entries[last + 1][3] == (key_a if (last + 1 - index) % 2 == 0 else key_b)
+            ):
+                last += 1
+            candidates.append((
+                entries[index][0],
+                last - index + 1,
+                entries[last][1] - entries[index][0],
+                entries[index][2],
+            ))
+            index = last + 1
         else:
-            consider()
-            current_key = key
-            current_start = start_ms
-            current_end = end_ms
-            current_length = 1
-            current_text = text
-    consider()
-    # A-B-A-B alternation: exact-run detector never exceeds length 1.
-    # A window of 8 blocks over <= 2 fuzzy-distinct captions is a loop
-    # (real dialogue alternates speakers, not identical sentences).
-    if best is None or best[1] < 6:
-        window = 8
-        for index in range(len(entries) - window + 1):
-            window_entries = entries[index:index + window]
-            distinct: list[str] = []
-            matched = True
-            for _start_ms, _end_ms, _text, key in window_entries:
-                placed = False
-                for seen in distinct:
-                    if _captions_are_near_identical(key, seen):
-                        placed = True
-                        break
-                if not placed:
-                    distinct.append(key)
-                    if len(distinct) > 2:
-                        matched = False
-                        break
-            if not matched or len(distinct) > 2:
-                continue
-            alternate_a = {window_entries[i][3] for i in range(0, window, 2)}
-            alternate_b = {window_entries[i][3] for i in range(1, window, 2)}
-            if len(alternate_a) == 1 and len(alternate_b) == 1:
-                span_ms = window_entries[-1][1] - window_entries[0][0]
-                return (window_entries[0][0], window, span_ms, window_entries[0][2])
-    if best is not None and (
-        (best[1] >= TRANSCRIPTION_LOOP_MIN_REPEATS
-         and best[2] >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000)
-        or best[1] >= TRANSCRIPTION_LOOP_BURST_REPEATS
-    ):
-        return best
-    return None
+            index += 1
+
+    # Low-diversity window: many captions, almost no distinct text, inside
+    # a short span. Catches 3-cycles and "A A B" shapes that are neither a
+    # run nor a strict alternation. Real speech has far more distinct text
+    # in 16 captions.
+    max_window_ms = 180_000
+    counts: dict[str, int] = {}
+    left = 0
+    for right in range(len(entries)):
+        counts[entries[right][3]] = counts.get(entries[right][3], 0) + 1
+        while entries[right][1] - entries[left][0] > max_window_ms:
+            left_key = entries[left][3]
+            counts[left_key] -= 1
+            if counts[left_key] == 0:
+                del counts[left_key]
+            left += 1
+        size = right - left + 1
+        if size >= TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS and len(counts) <= TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT:
+            candidates.append((
+                entries[left][0], size, entries[right][1] - entries[left][0], entries[left][2],
+            ))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[2], item[1]))
 
 
 def transcription_chunk_max_rms(chunk_audio_path: Path) -> float | None:
@@ -769,12 +882,20 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         # older flags are otherwise valid files, so without this the loader
         # below would silently reuse them and the flag change would only
         # apply to new VODs.
-        "decode_flags": "temp0-bs5-bo1-et2.6-lpt-0.8-nst0.5",
+        "decode_flags": f"temp0-bs5-bo1-et2.6-lpt-0.8-nst0.5-mc{TRANSCRIPTION_MAX_CONTEXT}",
         # One-way marker: every state written before the --vad removal lacks
         # this key, so its fingerprint can never equal a post-removal one.
         # Without it, a VAD-era state (same layout + knobs) would compare
         # equal and its smeared SRTs would be silently reused.
         "vad_removed": True,
+        # Detector generation: verdicts cached by an older detect_transcription_loop
+        # (longest-run gating, alternation skipped behind any 6x run) are
+        # stale - they marked looped chunks clean. Bump on detector changes.
+        "loop_detector": 2,
+        "loop_diversity": [
+            TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS,
+            TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT,
+        ],
     }
 
 
@@ -1256,21 +1377,28 @@ def transcribe_audio_in_chunks(
         ))
         _save_retry_state(chunk_dir, manifest, retries)
 
-    warnings_path = _transcription_warnings_path(chunk_dir)
-    warnings_temporary_path = warnings_path.with_suffix(".json.tmp")
-    warnings_temporary_path.write_text(json.dumps(warnings, indent=2), encoding="utf-8")
-    warnings_temporary_path.replace(warnings_path)
-    print(
-        f"Retry summary: {len(chunk_entries)} span(s) to stitch, "
-        f"{len(warnings)} warning(s) in {warnings_path.name}.",
-        flush=True,
-    )
     chunk_srt_paths = [entry_path for entry_path, _offset_ms in chunk_entries]
     chunk_offsets_ms = [entry_offset_ms for _entry_path, entry_offset_ms in chunk_entries]
 
     print("All chunk SRTs finished; stitching connected timestamps.", flush=True)
     output_path = output_dir / audio_path.with_suffix(".srt").name
-    return stitch_transcription_chunks(chunk_srt_paths, chunk_offsets_ms, output_path)
+    # Stitch before the warnings file is written so the silent-caption drops
+    # it records land in transcription_warnings.json; the file is still
+    # written when stitching raises (a muted-mic VOD has nothing to stitch).
+    warnings_path = _transcription_warnings_path(chunk_dir)
+    try:
+        return stitch_transcription_chunks(
+            chunk_srt_paths, chunk_offsets_ms, output_path, audio_path, warnings,
+        )
+    finally:
+        warnings_temporary_path = warnings_path.with_suffix(".json.tmp")
+        warnings_temporary_path.write_text(json.dumps(warnings, indent=2), encoding="utf-8")
+        warnings_temporary_path.replace(warnings_path)
+        print(
+            f"Retry summary: {len(chunk_entries)} span(s) stitched, "
+            f"{len(warnings)} warning(s) in {warnings_path.name}.",
+            flush=True,
+        )
 
 
 def split_caption_block(block: str, start_index: int) -> list[str]:
@@ -1289,14 +1417,30 @@ def split_caption_block(block: str, start_index: int) -> list[str]:
     return [make_srt_block(start_index, start_ms, end_ms, subtitle_text)]
 
 def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
-    """Fix bad Whisper SRT timestamps, collapse adjacent repeats, and renumber."""
+    """Fix bad Whisper SRT timestamps, clamp overlaps to wall-clock, dedup repeats."""
     input_path = input_path.resolve()
     output_path = (out_dir or input_path.parent) / f"{input_path.stem}_fixed.srt"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fixed_blocks: list[str] = []
+    block_starts: list[int | None] = []
+    block_ends: list[int | None] = []
     previous_end_ms = 0
     removed_sentence_count = 0
+    removed_overlap_count = 0
+
+    def _tail_idx() -> int | None:
+        for idx in range(len(fixed_blocks) - 1, -1, -1):
+            if block_ends[idx] is not None:
+                return idx
+        return None
+
+    def _retime_block(idx: int, start_ms: int, end_ms: int) -> None:
+        lines = re.split(r"\r?\n", fixed_blocks[idx])
+        lines[1] = f"{format_srt_time(start_ms)} --> {format_srt_time(end_ms)}"
+        fixed_blocks[idx] = "\r\n".join(lines)
+        block_starts[idx] = start_ms
+        block_ends[idx] = end_ms
 
     for block in split_srt_blocks(read_text(input_path)):
         lines = re.split(r"\r?\n", block)
@@ -1307,6 +1451,8 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
         time_line = lines[1]
         if "-->" not in time_line:
             fixed_blocks.append(block)
+            block_starts.append(None)
+            block_ends.append(None)
             continue
 
         start_text, end_text = [part.strip() for part in time_line.split("-->", 1)]
@@ -1320,11 +1466,50 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
             start_ms = previous_end_ms + 1
             end_ms = start_ms + 2_000
         elif start_ms < previous_end_ms:
-            duration_ms = end_ms - start_ms
-            if duration_ms > 5 * 60_000:
-                duration_ms = 2_000
-            start_ms = previous_end_ms + 1
-            end_ms = start_ms + duration_ms
+            # Overlapping caption: Whisper re-decoded audio an earlier block
+            # already covers (hallucinated "Thank you" chains spanning silence,
+            # chunk-seam double decodes, intra-chunk timing jitter). Shifting
+            # the current caption forward here accumulated +17 s of drift on
+            # the 2026-09-21 VOD (and compressed the Hayes->nasty gap 19.8 s
+            # to 2.1 s, defeating the merge gap-closer). Wall-clock decode
+            # times are the truth: shorten or drop the earlier block instead
+            # and keep the current caption where Whisper put it. Fully
+            # contained captions are kept too - real utterances often sit
+            # inside an over-long hallucinated span, and only the earlier
+            # block's display window shrinks; no text is ever lost here.
+            if end_ms - start_ms > 5 * 60_000:
+                end_ms = start_ms + 2_000
+            if start_ms == 0:
+                # Mid-file zero start: unplaceable (the clock never returns
+                # to zero). Shifting would drift everything after it, and the
+                # pop loop below would erase everything before it, so drop it.
+                removed_overlap_count += 1
+                continue
+            while True:
+                tail = _tail_idx()
+                if tail is None or start_ms >= previous_end_ms:
+                    break
+                tail_start = block_starts[tail]
+                assert tail_start is not None
+                new_tail_end = start_ms - 1
+                if new_tail_end <= tail_start:
+                    # Current starts at/before the tail's start (equal-start
+                    # re-decodes - the raw is start-sorted, so this is the
+                    # only way here): the tail's whole span is shadowed, so
+                    # drop it and re-check against the next earlier block.
+                    fixed_blocks.pop(tail)
+                    block_starts.pop(tail)
+                    block_ends.pop(tail)
+                    removed_overlap_count += 1
+                    new_tail = _tail_idx()
+                    if new_tail is None:
+                        previous_end_ms = 0
+                    else:
+                        previous_end_ms = block_ends[new_tail]  # type: ignore[assignment]
+                    continue
+                _retime_block(tail, tail_start, new_tail_end)
+                previous_end_ms = new_tail_end
+                break
 
         previous_end_ms = end_ms
         subtitle_text = normalize_caption_text(lines[2:])
@@ -1335,6 +1520,92 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
                 [index_line, f"{format_srt_time(start_ms)} --> {format_srt_time(end_ms)}", subtitle_text]
             )
         )
+        block_starts.append(start_ms)
+        block_ends.append(end_ms)
+
+    # Decoder-loop collapse: a maximal run of captions dominated (>= 90%) by
+    # one or two distinct texts is a stuck decoder (Thank-you chains over
+    # silence, A-B-A-B alternations like "I don't know"/"Why are you orange?"
+    # at ~1 s cadence for 13 min), not speech. The chunk-level detector
+    # cannot see these: exact runs never trip its span gate on short captions,
+    # and its alternation branch is skipped whenever the best exact run
+    # reaches 6 (a real 18x chorus blocks the 700x alternation behind it).
+    # Collapse each dominated run to its first caption per dominant text,
+    # keeping any minority (real-speech) captions in place. Kept heads retain
+    # wall-clock time; block_starts/ends stay aligned with fixed_blocks.
+    loop_collapsed_count = 0
+    collapse_marks: list[bool] = [False] * len(fixed_blocks)
+    run_start = 0
+    while run_start < len(fixed_blocks):
+        run_end = run_start
+        seen: dict[str, int] = {}
+        while run_end < len(fixed_blocks):
+            run_lines = re.split(r"\r?\n", fixed_blocks[run_end])
+            run_text = normalize_caption_text(run_lines[2:]) if len(run_lines) > 2 else ""
+            key = normalize_repeated_sentence_key(run_text)
+            seen[key] = seen.get(key, 0) + 1
+            if len(seen) > 2:
+                break
+            run_end += 1
+        run_length = run_end - run_start
+        if run_length >= TRANSCRIPTION_LOOP_BURST_REPEATS:
+            ordered = sorted(seen.items(), key=lambda item: -item[1])
+            top_two = sum(count for _key, count in ordered[:2])
+            if top_two / run_length >= 0.9:
+                dominant = {ordered[0][0]} | ({ordered[1][0]} if len(ordered) > 1 else set())
+                # Cadence guard: a stuck decoder fires every few seconds;
+                # real repeated speech ("Okay." acknowledgements across an
+                # hour) is minutes apart. Median inter-caption gap above
+                # 90 s vetoes the collapse.
+                run_gaps: list[int] = []
+                for gap_index in range(run_start + 1, run_end):
+                    gap_lines = re.split(r"\r?\n", fixed_blocks[gap_index])
+                    prev_lines = re.split(r"\r?\n", fixed_blocks[gap_index - 1])
+                    try:
+                        gap_start = parse_srt_time(gap_lines[1].split("-->", 1)[0].strip())
+                        prev_start = parse_srt_time(prev_lines[1].split("-->", 1)[0].strip())
+                        run_gaps.append(gap_start - prev_start)
+                    except (ValueError, IndexError):
+                        continue
+                run_gaps.sort()
+                median_gap_ms = run_gaps[len(run_gaps) // 2] if run_gaps else 0
+                if median_gap_ms <= 90_000:
+                    # NOTE: no is_repeat_sentence_candidate gate here. That
+                    # 3-word floor exists so the adjacent-dedup pass never
+                    # eats real speech ("Okay." x3 is emphasis, not a loop);
+                    # inside a 90%-dominated 30+ run it would instead shield
+                    # exactly the Thank-you/you/Okay chains this pass exists
+                    # to collapse.
+                    kept: set[str] = set()
+                    for index in range(run_start, run_end):
+                        mark_lines = re.split(r"\r?\n", fixed_blocks[index])
+                        mark_text = normalize_caption_text(mark_lines[2:]) if len(mark_lines) > 2 else ""
+                        mark_key = normalize_repeated_sentence_key(mark_text)
+                        if mark_key in dominant:
+                            if mark_key in kept:
+                                collapse_marks[index] = True
+                                loop_collapsed_count += 1
+                            else:
+                                kept.add(mark_key)
+                        # Minority captions (real speech inside the loop) stay.
+        run_start = run_end if run_end > run_start else run_start + 1
+    if loop_collapsed_count:
+        kept_blocks: list[str] = []
+        kept_starts: list[int | None] = []
+        kept_ends: list[int | None] = []
+        for block, start, end, marked in zip(fixed_blocks, block_starts, block_ends, collapse_marks):
+            if marked:
+                continue
+            kept_blocks.append(block)
+            kept_starts.append(start)
+            kept_ends.append(end)
+        fixed_blocks = kept_blocks
+        block_starts = kept_starts
+        block_ends = kept_ends
+        previous_end_ms = 0
+        for end in block_ends:
+            if end is not None:
+                previous_end_ms = end
 
     deduped_blocks: list[str] = []
     previous_text_key: str | None = None
@@ -1351,7 +1622,6 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
 
         deduped_blocks.append(block)
         previous_text_key = text_key or None
-
     renumbered_blocks: list[str] = []
     counter = 1
     for block in deduped_blocks:
@@ -1359,8 +1629,12 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
         renumbered_blocks.extend(split_blocks)
         counter += len(split_blocks)
 
+    if loop_collapsed_count:
+        print(f"Collapsed {loop_collapsed_count} decoder-loop caption(s) to run heads")
     if removed_block_count:
         print(f"Removed {removed_block_count} consecutive repeated subtitle block(s)")
+    if removed_overlap_count:
+        print(f"Trimmed {removed_overlap_count} overlapping caption(s) back to wall-clock time")
     if removed_sentence_count:
         print(f"Removed {removed_sentence_count} consecutive repeated sentence(s)")
 
