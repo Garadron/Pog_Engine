@@ -327,9 +327,9 @@ def _clean_chunk_srt(
     if not dropped:
         return
     print(
-        f"[HALLUCINATION] {chunk_srt_path.name}: dropped {len(dropped)} caption(s) the audio "
-        f"cannot support (digital silence, or filler phrase under peak RMS "
-        f"{TRANSCRIPTION_GENERIC_PHRASE_RMS}).",
+        f"[HALLUCINATION] {chunk_srt_path.name}: dropped {len(dropped)} invented caption(s) "
+        f"(digital silence, filler phrase under peak RMS {TRANSCRIPTION_GENERIC_PHRASE_RMS}, "
+        f"or the Amara.org credit line).",
         flush=True,
     )
     warnings.append({
@@ -416,19 +416,32 @@ WHISPER_GENERIC_PHRASES = frozenset({
 })
 
 
+def _is_phantom_credit(text_key: str) -> bool:
+    """Whisper's training-data credit line ("Subtitles by the Amara.org
+    community", "www.amara.org"). Nobody says it on a stream, so it is invented
+    whatever the audio level: one of them sat over peak-0.04 audio where real
+    speech was replaced."""
+    return "amaraorg" in text_key
+
+
 def drop_hallucinated_captions(
     entries: list[tuple[int, int, str, int]],
     audio_path: Path,
 ) -> tuple[list[tuple[int, int, str, int]], list[dict[str, object]]]:
     """Drop captions the audio under them cannot support.
 
-    Two cases, judged on the peak 1 s RMS across the span (+-1 s):
-    - digital silence (< TRANSCRIPTION_SILENCE_RMS): any text. The mic WAV is
-      noise-gated, so dead air reads as exact zero and whatever Whisper prints
-      over it ("Subtitles by the Amara.org community") is invented.
-    - faint noise (< TRANSCRIPTION_GENERIC_PHRASE_RMS) under a generic filler
-      phrase ("Thank you."). 212 of 329 filler captions across five VODs sat
-      below 0.02, 94% of them 10 s+ blocks; real speech peaks far higher.
+    Three cases:
+    - digital silence (peak 1 s RMS across the span +-1 s below
+      TRANSCRIPTION_SILENCE_RMS): any text. The mic WAV is noise-gated, so dead
+      air reads as exact zero and whatever Whisper prints over it is invented.
+      The +-1 s margin absorbs Whisper's coarse caption times for real speech.
+    - faint noise (peak across the span ITSELF, no margin, below
+      TRANSCRIPTION_GENERIC_PHRASE_RMS) under a generic filler phrase
+      ("Thank you."). 212 of 329 filler captions across five VODs sat below
+      0.02, 94% of them 10 s+ blocks; real speech peaks far higher. No margin
+      here: a 30 s filler block ends exactly where the next real caption
+      starts, so the margin read that speech and kept 2-7 blocks per VOD.
+    - the Amara.org credit line, at any level (_is_phantom_credit).
     Unreadable audio keeps everything. Returns (kept, dropped-records).
     """
     blocks = _load_rms_blocks(audio_path)
@@ -436,20 +449,32 @@ def drop_hallucinated_captions(
         return entries, []
     kept: list[tuple[int, int, str, int]] = []
     dropped: list[dict[str, object]] = []
+    top = len(blocks) - 1
     for entry in entries:
         start_ms, end_ms, text, _chunk_index = entry
-        first = max(0, start_ms // 1_000 - 1)
-        last = min(len(blocks) - 1, end_ms // 1_000 + 1)
-        peak = max(blocks[first:last + 1], default=None)
-        if peak is not None and (
-            peak < TRANSCRIPTION_SILENCE_RMS
+        margin_peak = max(
+            blocks[max(0, start_ms // 1_000 - 1):min(top, end_ms // 1_000 + 1) + 1],
+            default=None,
+        )
+        first = min(top, start_ms // 1_000)
+        span_peak = max(
+            blocks[first:max(first, min(top, (end_ms - 1) // 1_000)) + 1],
+            default=None,
+        )
+        key = normalize_repeated_sentence_key(text)
+        if (
+            _is_phantom_credit(key)
+            or (margin_peak is not None and margin_peak < TRANSCRIPTION_SILENCE_RMS)
             or (
-                peak < TRANSCRIPTION_GENERIC_PHRASE_RMS
-                and normalize_repeated_sentence_key(text) in WHISPER_GENERIC_PHRASES
+                span_peak is not None
+                and span_peak < TRANSCRIPTION_GENERIC_PHRASE_RMS
+                and key in WHISPER_GENERIC_PHRASES
             )
         ):
+            peak = span_peak if span_peak is not None else margin_peak
             dropped.append({
-                "start_ms": start_ms, "end_ms": end_ms, "text": text, "peak_rms": round(peak, 5),
+                "start_ms": start_ms, "end_ms": end_ms, "text": text,
+                "peak_rms": None if peak is None else round(peak, 5),
             })
         else:
             kept.append(entry)
