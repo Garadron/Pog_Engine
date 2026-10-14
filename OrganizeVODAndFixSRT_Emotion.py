@@ -770,8 +770,13 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
         # entropy/logprob/no-speech thresholds). Stale SRTs decoded under
         # older flags are otherwise valid files, so without this the loader
         # below would silently reuse them and the flag change would only
-        # apply to new VODs.
-        "decode_flags": "temp0-bs5-bo1-et2.6-lpt-0.8-nst0.5",
+        # apply to new VODs. The configurable decode inputs (-mc context and
+        # -l language) are appended automatically, so changing either in the
+        # config GUI invalidates old chunk SRTs without a manual delete.
+        "decode_flags": (
+            "temp0-bs5-bo1-et2.6-lpt-0.8-nst0.5"
+            f"-mc{TRANSCRIPTION_MAX_CONTEXT}-lang{TRANSCRIPTION_LANGUAGE}"
+        ),
         # One-way marker: every state written before the --vad removal lacks
         # this key, so its fingerprint can never equal a post-removal one.
         # Without it, a VAD-era state (same layout + knobs) would compare
