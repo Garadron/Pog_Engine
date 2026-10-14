@@ -83,7 +83,7 @@ Flat repo — no subdirectories. Source files at root:
 | `pog_engine_setup.py` | Setup/verification installer (GUI + `--cli`): checks dependencies, downloads models, patches machine-specific paths. |
 | `configure_models.py` | Tk GUI for choosing Ollama models / pipeline defaults. Renders one form from the `EDITABLE_PARAMS` registry, applies `PRESETS`, and saves via `pipeline_config.apply_config_values()`, which rewrites that file's own default literals. Opened via `ConfigurePogEngine.bat` or the organizer's `--config`. |
 | `OrganizeVODAndFixSRT_Emotion.bat` | Launcher: `python OrganizeVODAndFixSRT_Emotion.py "%~1"` (drag-drop a VOD onto a shortcut to it). |
-| `Install_PogEngine.bat` | Bootstrap launcher: enforces exactly Python 3.12 (auto-installs 3.12.10 when missing or any other version, prompts old-version uninstall), then runs `pog_engine_setup.py <folder>`. |
+| `Install_PogEngine.bat` | Bootstrap launcher: GPU-class Python gate (AMD exactly 3.12, NVIDIA/other 3.12 or newer; auto-installs 3.12.10 when no acceptable Python is found, prompts old-version uninstall), then runs `pog_engine_setup.py <folder>`. |
 | `ConfigurePogEngine.bat` | Launcher: `python OrganizeVODAndFixSRT_Emotion.py --config --no-pause` (opens the config GUI; no video needed). |
 | `plan.md` | Test-run journal of the single-track sample VOD: bug discoveries (#1 bat paren crash, #8 stats inflation, #9 judge silent no-op) with repros, fixes, and verification notes. |
 
@@ -149,12 +149,12 @@ No `pytest`, `lint`, `format`, or `test` commands exist.
   **`:1641`** — `run_all_gui()` (the redesigned pipeline-map runner); **`:3763`** — `organize_video()` (folder setup + the generated `.bat` files + `vod_audio_info.json`); **`:3861`** — `parse_args()` (subcommands incl. `--config`).
 - **`pog_engine_setup.py`** — `patch_paths()` (`:513`) rewrites the `r"G:\pog_dev\…"` raw-string constants (incl. `TORCH_CACHE_DIR` *and* `HF_CACHE_DIR` in `isolate_vocals.py`) to the chosen install folder; **`:688`** `_demucs_repo_dir()` presence-check anchored on the real `models--adefossez--HTDemucs` HF repo (not a loose file extension); **`:712`** `_migrate_default_hf_htdemucs()` moves an orphaned copy from the default user cache into the redirect; **`:743`** `predownload_demucs_model()` sets `TORCH_HUB_CACHE`/`HF_HUB_CACHE` (not just `*_HOME`) so the redirect actually holds; **`:1163`** `run_all_checks()` orders the install phases; **`:1524`** `main()` (`--cli` vs GUI).
 - **`configure_models.py`** — config GUI (opened by `ConfigurePogEngine.bat` or the organizer's `--config`, which lazy-imports it so a config edit never loads the heavyweight pipeline imports). Renders one form from `EDITABLE_PARAMS`, applies `PRESETS`, saves via `cfg.apply_config_values()`.
-- **`Install_PogEngine.bat`** — prerequisite Python bootstrap: locates `python`/`py`, installs python-3.12.10-amd64.exe silently when absent or not exactly 3.12 (other installs left untouched, uninstall recommended via prompt), then hands to `pog_engine_setup.py`.
+- **`Install_PogEngine.bat`** — prerequisite Python bootstrap: locates `python`/`py`, installs python-3.12.10-amd64.exe silently when no Python passes the GPU-class gate (AMD exactly 3.12, others 3.12 or newer; other installs left untouched, uninstall recommended via prompt), then hands to `pog_engine_setup.py`.
 
 ## Runtime/Tooling Preferences
 
 - **OS: Windows only** — generates `.bat` files and uses Windows `pause` prompts. Installation is driven by `Install_PogEngine.bat`, which can bootstrap Python through a downloaded `.exe`; Pog Engine itself is not a packaged executable.
-- **Python 3.12 exactly (3.12.10 via the installer bootstrap)** — required and enforced by the launcher (anything but 3.12 triggers an automatic 3.12.10 install; no other version is ever used). `pog_engine_setup.py` still warns instead of failing on other versions for direct-script runs, with ROCm torch the hard 3.12 requirement.
+- **Python 3.12 (3.12.10 via the installer bootstrap)** — exactly 3.12 on AMD (ROCm wheels are cp312-only); since upstream V2.0 (2026-10-06) NVIDIA/other boxes also accept 3.13+, so the launcher no longer forces 3.12 there (anything below 3.12, or non-3.12 on AMD, triggers an automatic 3.12.10 install). 3.13/3.14 with torch/demucs/librosa is untested on this fork. `pog_engine_setup.py` still warns instead of failing on other versions for direct-script runs, with ROCm torch the hard 3.12 requirement.
 - **No virtualenv is created** by setup; packages install into the interpreter that ran the setup. The legacy `.gitignore` mentions `2.0/.venv/` and `2.0/pog_engine.egg-info/` (a previous packaging layout, since abandoned).
 - **External binaries the pipeline shells out to** (must be on PATH or referenced by the patched path constants):
   - **Ollama** (default, `LLM_BACKEND="ollama"`) — must be pre-installed by the user, running model `qwen3.5:9b-q4_K_M` at `OLLAMA_URL`/`OLLAMA_CHAT_URL` (both pipeline roles default to it; `qwen3:8b` remains a supported alternative in the tuning tables) (default `http://localhost:11434`). `qwen3.5` thinking is disabled via `/api/chat` `think:false` to dodge ollama/ollama#14793 (verify/judge use it on `JUDGE_MODEL`; discovery/titling use it on `MODEL`). The setup verifies the models are pulled. *Alternative:* **llama.cpp** (`LLM_BACKEND="llamacpp"`) — `llama-server` + per-role GGUFs (`LLAMA_DISCOVERY_MODEL_PATH`/`LLAMA_JUDGE_MODEL_PATH`, fallback `LLAMA_MODEL_PATH`) at `LLAMA_SERVER_URL` (default `http://localhost:8080`). The analyzer manages `llama-server` and hot-swaps GGUFs (discovery→stop for emotion→judge) so no manual `Start_LlamaServer.bat` is required; that bat is kept only for manual testing. `LLAMA_CONTEXT_SIZE` (`-c`) replaces per-request `num_ctx`. Setup verifies `llama-server` on PATH and GGUF existence; RunAll checks GGUF existence instead of `/health`.
@@ -1256,3 +1256,39 @@ format change. Synthetic checks: zero-budget span decodes once and stitches
 ### Resume
 Re-run that VOD's `2_TranscribeAudio.bat` (Step 1 chunks reused; stale SRTs
 auto-cleared), then steps 3-5 normally.
+
+## Fix History: merge of upstream V2.0 into the fork (2026-10-14)
+
+### What came in
+Five kaizcodes commits (`ae9ec80`..`5aab4d2`, 2026-10-06/07), all Step 2 or
+installer work: `_transcribe_audio_chunk()` flags (`--temperature 0`,
+`--best-of 1`, `--no-speech-thold 0.5`, `-fa`, `-t 8`); `TRANSCRIPTION_RETRY_BUDGET_FACTOR`
+1.0 -> 2.0 with budget-exhausted spans decoded once instead of skipped (no
+transcript holes); `TRANSCRIPTION_LOOP_BURST_REPEATS` plus alternation and
+one-block loop detection; pre-decode silence skip (`_chunk_audio_is_silent`);
+fuzzy overlap dedup with per-seam stats in `stitch_transcription_chunks()`;
+`decode_flags` fingerprint + `_clear_stale_decode_srts()`; 3-column judge CSV
+parse; GPU-class Python gate in `Install_PogEngine.bat`; config GUI help
+re-wrap; `ensure_whisper_packages()` in setup. `POG_ENGINE_VERSION = "2.0.0"`
+was already present before this merge - the "V2.0" commits did not change it.
+
+### Resolutions
+- `-mc` stays `str(TRANSCRIPTION_MAX_CONTEXT)` (default 0, our 2026-09-30
+  loop fix) and `--temperature 0` is added; upstream hardcodes `-mc -1`.
+- `.gitignore`: union. `AGENTS.md`: upstream deleted it; kept at its last
+  upstream version (ours + their Whisper fix-history section) and the
+  Python-gate lines updated for the new launcher behavior.
+- Follow-up fix: upstream's setup edit dropped the final
+  `return all_ok and demucs_model_ok` of `_verify_python_packages()`, so
+  `packages_ok` was always None and the installer never went green or created
+  the drag shortcut. Restored in a separate commit.
+
+### Not verified / open
+Nothing here was run on a real VOD in this fork (merge checked by
+compilation, import-name and `EDITABLE_PARAMS` integrity, and a synthetic
+loop-detector test). Upstream tuned the flags with `-mc -1` on English audio;
+this fork runs `-mc 0` on Italian. `decode_flags` does not include `-mc` or the
+language, so changing `TRANSCRIPTION_MAX_CONTEXT`/`TRANSCRIPTION_LANGUAGE`
+still needs the chunk SRTs deleted by hand. `pog_engine_update.py` still
+defaults to `kaizcodes/Pog_Engine` (`POG_ENGINE_REPO` overrides it), so an
+installed fork running the updater would pull upstream releases.
