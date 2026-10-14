@@ -1287,8 +1287,16 @@ was already present before this merge - the "V2.0" commits did not change it.
 Nothing here was run on a real VOD in this fork (merge checked by
 compilation, import-name and `EDITABLE_PARAMS` integrity, and a synthetic
 loop-detector test). Upstream tuned the flags with `-mc -1` on English audio;
-this fork runs `-mc 0` on Italian. `decode_flags` does not include `-mc` or the
-language, so changing `TRANSCRIPTION_MAX_CONTEXT`/`TRANSCRIPTION_LANGUAGE`
-still needs the chunk SRTs deleted by hand. `pog_engine_update.py` still
-defaults to `kaizcodes/Pog_Engine` (`POG_ENGINE_REPO` overrides it), so an
-installed fork running the updater would pull upstream releases.
+this fork runs `-mc 0` on Italian.
+
+### Follow-ups applied after the merge
+- `decode_flags` now appends `-mc<TRANSCRIPTION_MAX_CONTEXT>-lang<TRANSCRIPTION_LANGUAGE>`
+  automatically, so changing either in the config GUI clears the stale chunk
+  SRTs (audio is reused). Checked with a temp chunk dir: same settings keep
+  the SRTs, changed `-mc` or language removes them. Consequence: the first
+  Step 2 run on a VOD transcribed before this merge re-transcribes its chunks
+  once.
+- `pog_engine_update.py` defaults to `Garadron/Pog_Engine` instead of
+  `kaizcodes/Pog_Engine`, so an installed fork can never pull upstream
+  releases by accident. The fork publishes no releases and does not use the
+  updater; running it just fails with a GitHub 404.
