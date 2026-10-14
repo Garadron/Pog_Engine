@@ -2,9 +2,13 @@
 *.rar
 
 # Local runtime artifacts / downloaded models - never commit these (multi-GB binaries)
-__pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+build/
+dist/
 ffmpeg/
 models/
 pipeline_run_history.csv
 
+# Deferred LM Studio/Bionic experiment
+deferred_lm_studio/
