@@ -23,7 +23,7 @@ Replaced originals are kept in update_backup_<tag>_<timestamp>/ next to the
 scripts, so any update can be undone by copying the backup back.
 
 Release contract (maintainer side): every GitHub release on
-kaizcodes/Pog_Engine must attach a ``PogEngine.zip`` asset holding the
+Garadron/Pog_Engine must attach a ``PogEngine.zip`` asset holding the
 managed files below at the zip root (a single top-level folder is also
 accepted), and bump POG_ENGINE_VERSION in pipeline_config.py to the release
 number (tag = "v" + version, e.g. v2.0.0).
@@ -61,7 +61,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-GITHUB_REPO = os.environ.get("POG_ENGINE_REPO", "kaizcodes/Pog_Engine")
+GITHUB_REPO = os.environ.get("POG_ENGINE_REPO", "Garadron/Pog_Engine")
 API_BASE = "https://api.github.com/repos"
 USER_AGENT = "PogEngine-Updater/1.0"
 
