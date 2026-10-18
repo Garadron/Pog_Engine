@@ -1300,3 +1300,38 @@ this fork runs `-mc 0` on Italian.
   `kaizcodes/Pog_Engine`, so an installed fork can never pull upstream
   releases by accident. The fork publishes no releases and does not use the
   updater; running it just fails with a GitHub 404.
+
+## Fix History: merge of upstream 14-15 Oct + Italian filler (2026-10-18)
+
+### What came in
+Four kaizcodes commits (`721918a`..`3ab0b89`). Step 2 decodes every chunk once; the
+loop-retry layer is gone with TRANSCRIPTION_RETRY_MIN_MINUTES and
+TRANSCRIPTION_RETRY_BUDGET_FACTOR. Captions the audio cannot support are stripped
+before loop detection (`drop_hallucinated_captions`): any text over digital silence,
+filler phrases under TRANSCRIPTION_GENERIC_PHRASE_RMS, and the Amara.org credit line.
+The loop detector checks every shape and adds a diversity gate, and Step 3 shares
+it. Discovery gains a backfill and a wide-window title merge. Upstream reached
+`-mc 0` on its own and added its own TRANSCRIPTION_MAX_CONTEXT.
+
+### Resolutions
+- `decode_flags` keeps the fork's form (`...-mc0-langit`). The string is unchanged,
+  so existing chunk SRTs stay valid and nothing re-decodes.
+- The duplicate TRANSCRIPTION_MAX_CONTEXT definition and `EDITABLE_PARAMS` entry
+  from the auto-merge were folded into one, with upstream's help text.
+
+### Fork-only addition: Italian filler
+Measured on the 12 Italian lives of 2-17 Oct (read-only, raw stitched SRT + mic WAV):
+- "Grazie a tutti." (208) and "Grazie per la visione." (8) under 0.02 were all 30 s
+  blocks with no speech, so both joined `WHISPER_GENERIC_PHRASES`;
+- "Autore dei sottotitoli e revisione a cura di QTSS" is Whisper's Italian credit
+  line: 79 survived the other checks, some over peak-0.2 speech, so
+  `_is_phantom_credit` drops it at any level, like Amara.org;
+- a bare "Grazie" and "Ciao a tutti" stay: mostly short captions, often really said.
+
+### Verification
+`py_compile` and imports clean; every `EDITABLE_PARAMS` key has a definition. On a
+copy of the 2026-10-17 VOD, Step 2 reused all 3 chunk SRTs (no Whisper, 1 s) and
+dropped 90 invented captions. Step 3 went from 380 to 320 captions. The only texts
+gone were the QTSS line (34 distinct), the "Grazie a tutti." blocks, and one "come?"
+over digital silence. No caption was added. Discovery's backfill and title merge
+(LLM side) were not run here.

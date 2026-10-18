@@ -45,8 +45,9 @@ from pipeline_config import (
     TRANSCRIPTION_MAX_CONTEXT,
     TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
     TRANSCRIPTION_LOOP_BURST_REPEATS,
-    TRANSCRIPTION_RETRY_MIN_MINUTES,
-    TRANSCRIPTION_RETRY_BUDGET_FACTOR,
+    TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS,
+    TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT,
+    TRANSCRIPTION_GENERIC_PHRASE_RMS,
     TRANSCRIPTION_SILENCE_RMS,
     VOCAL_ISOLATION_MODEL,
     ollama_base_url,
@@ -256,6 +257,11 @@ def _transcribe_audio_chunk(
         "-fa",
         "-t", "8",
     ]
+    # -mc 0 (TRANSCRIPTION_MAX_CONTEXT): whisper.cpp's default carries all
+    # previous-window text into the next window's prompt, and on sparse
+    # speech over dead air the decoder then repeats its own last caption
+    # once per window for minutes (the transcript hole IS the loop; the
+    # speech under it is never decoded). See pipeline_config.py.
     # No --vad: VAD concatenated detected speech and stretched captions back
     # across the excised silence, smearing timestamps over minutes of dead
     # air. Wall-clock decode is slower but stays true. No --no-fallback
@@ -289,6 +295,63 @@ def _transcribe_audio_chunk(
         )
 
 
+def strip_hallucinated_captions(chunk_audio_path: Path, chunk_srt_path: Path) -> list[dict[str, object]]:
+    """Rewrite a chunk SRT without captions the audio cannot support.
+
+    Runs on every chunk SRT BEFORE loop detection: filler chains ("Thank
+    you." once per window over dead air) otherwise look like decoder loops.
+    Idempotent (a clean SRT is left untouched), so cached SRTs get the same
+    treatment as fresh decodes. Returns the dropped captions in the
+    chunk-local clock.
+    """
+    entries = _read_transcription_chunk(chunk_srt_path, 0, 0)
+    kept, dropped = drop_hallucinated_captions(entries, chunk_audio_path)
+    if dropped:
+        blocks = [
+            make_srt_block(index, start_ms, end_ms, text)
+            for index, (start_ms, end_ms, text, _chunk_index) in enumerate(kept, start=1)
+        ]
+        temporary_path = chunk_srt_path.with_name(chunk_srt_path.name + ".tmp")
+        write_text_crlf(temporary_path, "\r\n\r\n".join(blocks), encoding="utf-8")
+        temporary_path.replace(chunk_srt_path)
+    return dropped
+
+
+def _clean_chunk_srt(
+    chunk_audio_path: Path,
+    chunk_srt_path: Path,
+    chunk_label: str,
+    warnings: list[dict[str, object]],
+) -> None:
+    """strip_hallucinated_captions plus the transcription_warnings.json record."""
+    dropped = strip_hallucinated_captions(chunk_audio_path, chunk_srt_path)
+    if not dropped:
+        return
+    print(
+        f"[HALLUCINATION] {chunk_srt_path.name}: dropped {len(dropped)} invented caption(s) "
+        f"(digital silence, filler phrase under peak RMS {TRANSCRIPTION_GENERIC_PHRASE_RMS}, "
+        f"or a subtitle credit line: Amara.org, QTSS).",
+        flush=True,
+    )
+    warnings.append({
+        "chunk": chunk_label,
+        "kind": "hallucinated-captions-dropped",
+        "detail": f"{chunk_srt_path.name}: {len(dropped)} caption(s) removed (chunk-local times).",
+        "captions": dropped,
+    })
+
+
+def _decode_chunk(
+    chunk_audio_path: Path,
+    chunk_srt_path: Path,
+    chunk_label: str,
+    warnings: list[dict[str, object]],
+) -> None:
+    """Decode one chunk with whisper.cpp, then strip hallucinated captions."""
+    _transcribe_audio_chunk(chunk_audio_path, chunk_srt_path)
+    _clean_chunk_srt(chunk_audio_path, chunk_srt_path, chunk_label, warnings)
+
+
 def _read_transcription_chunk(
     chunk_srt_path: Path,
     offset_ms: int,
@@ -309,6 +372,121 @@ def _read_transcription_chunk(
         if text:
             entries.append((start_ms, end_ms, text, chunk_index))
     return entries
+
+
+def _load_rms_blocks(audio_path: Path) -> list[float] | None:
+    """1 s-block RMS (0..1) of a 16-bit PCM WAV; None when unreadable.
+
+    Streams the file in 2-minute reads so a 5 h mic WAV (~600 MB) never sits
+    in memory whole."""
+    try:
+        import numpy as np
+        import wave
+        blocks: list[float] = []
+        with wave.open(str(audio_path), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                return None
+            rate = wav.getframerate()
+            channels = wav.getnchannels()
+            while True:
+                raw = wav.readframes(rate * 120)
+                if not raw:
+                    break
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if channels > 1:
+                    samples = samples.reshape(-1, channels).mean(axis=1)
+                whole = samples.size // rate
+                if whole:
+                    blocks.extend(
+                        np.sqrt((samples[:whole * rate].reshape(whole, rate) ** 2).mean(axis=1)).tolist()
+                    )
+                if samples.size % rate:
+                    blocks.append(float((samples[whole * rate:] ** 2).mean() ** 0.5))
+        return blocks
+    except (ImportError, OSError, EOFError, ValueError):
+        return None
+
+
+# Whisper's silence/noise filler. On gated dead air or faint room noise it
+# prints one of these per 30 s window. Content-free by construction, so a
+# wrongly dropped one costs nothing downstream (no highlight lives in them).
+WHISPER_GENERIC_PHRASES = frozenset({
+    "thank you", "thanks", "you", "bye", "bye bye", "thank you so much",
+    "thank you very much", "thanks for watching", "thank you for watching",
+    "please subscribe", "see you next time",
+    # Fork, Italian VODs (measured 2026-10-18 on 12 lives): every one of the
+    # 208 "Grazie a tutti." and 8 "Grazie per la visione." captions under 0.02
+    # was a 30 s block with no speech. A bare "Grazie" stays: mostly short
+    # captions, often really said.
+    "grazie a tutti", "grazie per la visione",
+})
+
+
+def _is_phantom_credit(text_key: str) -> bool:
+    """Whisper's training-data credit line ("Subtitles by the Amara.org
+    community", "www.amara.org"; in Italian "Autore dei sottotitoli e revisione
+    a cura di QTSS"). Nobody says it on a stream, so it is invented whatever
+    the audio level: one of them sat over peak-0.04 audio where real speech was
+    replaced, and 79 QTSS lines survived the other checks on the fork's 12
+    Italian lives, some over peak-0.2 speech."""
+    return "amaraorg" in text_key or "qtss" in text_key
+
+
+def drop_hallucinated_captions(
+    entries: list[tuple[int, int, str, int]],
+    audio_path: Path,
+) -> tuple[list[tuple[int, int, str, int]], list[dict[str, object]]]:
+    """Drop captions the audio under them cannot support.
+
+    Three cases:
+    - digital silence (peak 1 s RMS across the span +-1 s below
+      TRANSCRIPTION_SILENCE_RMS): any text. The mic WAV is noise-gated, so dead
+      air reads as exact zero and whatever Whisper prints over it is invented.
+      The +-1 s margin absorbs Whisper's coarse caption times for real speech.
+    - faint noise (peak across the span ITSELF, no margin, below
+      TRANSCRIPTION_GENERIC_PHRASE_RMS) under a generic filler phrase
+      ("Thank you."). 212 of 329 filler captions across five VODs sat below
+      0.02, 94% of them 10 s+ blocks; real speech peaks far higher. No margin
+      here: a 30 s filler block ends exactly where the next real caption
+      starts, so the margin read that speech and kept 2-7 blocks per VOD.
+    - the Amara.org credit line, at any level (_is_phantom_credit).
+    Unreadable audio keeps everything. Returns (kept, dropped-records).
+    """
+    blocks = _load_rms_blocks(audio_path)
+    if blocks is None:
+        return entries, []
+    kept: list[tuple[int, int, str, int]] = []
+    dropped: list[dict[str, object]] = []
+    top = len(blocks) - 1
+    for entry in entries:
+        start_ms, end_ms, text, _chunk_index = entry
+        margin_peak = max(
+            blocks[max(0, start_ms // 1_000 - 1):min(top, end_ms // 1_000 + 1) + 1],
+            default=None,
+        )
+        first = min(top, start_ms // 1_000)
+        span_peak = max(
+            blocks[first:max(first, min(top, (end_ms - 1) // 1_000)) + 1],
+            default=None,
+        )
+        key = normalize_repeated_sentence_key(text)
+        if (
+            _is_phantom_credit(key)
+            or (margin_peak is not None and margin_peak < TRANSCRIPTION_SILENCE_RMS)
+            or (
+                span_peak is not None
+                and span_peak < TRANSCRIPTION_GENERIC_PHRASE_RMS
+                and key in WHISPER_GENERIC_PHRASES
+            )
+        ):
+            peak = span_peak if span_peak is not None else margin_peak
+            dropped.append({
+                "start_ms": start_ms, "end_ms": end_ms, "text": text,
+                "peak_rms": None if peak is None else round(peak, 5),
+            })
+        else:
+            kept.append(entry)
+    return kept, dropped
 
 
 def stitch_transcription_chunks(
@@ -593,27 +771,112 @@ def _block_intra_repeat_ratio(text: str) -> float:
         previous_key = sentence_key
     return repeated / len(sentence_units)
 
-def detect_transcription_loop(
-    chunk_srt_path: Path,
-) -> tuple[int, int, int, str] | None:
-    """Find a decoder repeat loop: consecutive run, alternation, or one-block.
 
-    Returns (onset_ms, run_length, span_ms, text) in the chunk-local clock.
-    Flags when EITHER gate trips: the classic run reaches
-    TRANSCRIPTION_LOOP_MIN_REPEATS captions spanning at least
-    TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS, OR the burst gate reaches
-    TRANSCRIPTION_LOOP_BURST_REPEATS identical captions at any span (fast
-    silence chains like 3 s "Thank you" blocks hit 30x in ~90 s without
-    tripping the 180 s span gate). Whole-chunk checks would miss the tail
-    shape (chunk had 247 blocks, only the tail looped), so detection is
-    run-localized and reports the onset. Additionally flags an A-B-A-B
-    alternation of two fuzz-matched captions (run length never exceeds 1
-    there) and a single caption whose sentences are >= 50% repeats.
+def find_transcription_loop_spans(
+    entries: list[tuple[int, int, str, str]],
+) -> list[tuple[int, int]]:
+    """Inclusive index ranges of every decoder-loop shape in a start-sorted
+    caption list of (start_ms, end_ms, text, key); overlapping ranges merge.
+
+    One core shared by Step 2 (flags a chunk) and Step 3 (collapses what slips
+    through), so the two can never disagree about what a loop is. Shapes:
+    - exact run: TRANSCRIPTION_LOOP_MIN_REPEATS identical captions spanning at
+      least TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS, OR TRANSCRIPTION_LOOP_BURST_REPEATS
+      identical captions at any span (fast silence chains hit 30x in ~90 s
+      without tripping the span gate);
+    - strict A-B-A-B alternation of two fuzz-matched captions (an exact-run scan
+      never exceeds length 1 there; real dialogue alternates speakers, not
+      identical sentences);
+    - diversity window: TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS captions inside
+      180 s carrying at most TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT texts
+      (3-cycles, "A A B", fast runs under the burst gate);
+    - one caption whose own sentences are >= 50% repeats.
+    Every shape is collected, not just the longest run: a fast harmless run
+    (23x over 89 s, under the burst gate) once shadowed the real 18x over 359 s
+    loop in the same chunk, and skipping the alternation scan whenever any run
+    reached 6 let an 18x/18 s run hide 700 alternating captions (09-24 VOD
+    chunks 3 and 6, 2026-10-14).
     """
+    ranges: list[tuple[int, int]] = []
+
+    for index, entry in enumerate(entries):
+        if _block_intra_repeat_ratio(entry[2]) >= 0.5:
+            ranges.append((index, index))
+
+    run_start = 0
+    while run_start < len(entries):
+        run_end = run_start
+        while run_end + 1 < len(entries) and entries[run_end + 1][3] == entries[run_start][3]:
+            run_end += 1
+        length = run_end - run_start + 1
+        span_ms = entries[run_end][1] - entries[run_start][0]
+        if (
+            (length >= TRANSCRIPTION_LOOP_MIN_REPEATS
+             and span_ms >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000)
+            or length >= TRANSCRIPTION_LOOP_BURST_REPEATS
+        ):
+            ranges.append((run_start, run_end))
+        run_start = run_end + 1
+
+    window = 8
+    index = 0
+    while index + window <= len(entries):
+        window_entries = entries[index:index + window]
+        distinct: list[str] = []
+        for window_entry in window_entries:
+            if not any(_captions_are_near_identical(window_entry[3], seen) for seen in distinct):
+                distinct.append(window_entry[3])
+                if len(distinct) > 2:
+                    break
+        if len(distinct) <= 2 and (
+            len({window_entries[i][3] for i in range(0, window, 2)}) == 1
+            and len({window_entries[i][3] for i in range(1, window, 2)}) == 1
+            and window_entries[0][3] != window_entries[1][3]
+        ):
+            key_a, key_b = window_entries[0][3], window_entries[1][3]
+            last = index + window - 1
+            while (
+                last + 1 < len(entries)
+                and entries[last + 1][3] == (key_a if (last + 1 - index) % 2 == 0 else key_b)
+            ):
+                last += 1
+            ranges.append((index, last))
+            index = last + 1
+        else:
+            index += 1
+
+    max_window_ms = 180_000
+    counts: dict[str, int] = {}
+    left = 0
+    for right in range(len(entries)):
+        counts[entries[right][3]] = counts.get(entries[right][3], 0) + 1
+        while entries[right][1] - entries[left][0] > max_window_ms:
+            left_key = entries[left][3]
+            counts[left_key] -= 1
+            if counts[left_key] == 0:
+                del counts[left_key]
+            left += 1
+        if (
+            right - left + 1 >= TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS
+            and len(counts) <= TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT
+        ):
+            ranges.append((left, right))
+
+    merged: list[tuple[int, int]] = []
+    for first, last in sorted(ranges):
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], last))
+        else:
+            merged.append((first, last))
+    return merged
+
+
+def _read_loop_entries(chunk_srt_path: Path) -> list[tuple[int, int, str, str]]:
+    """(start_ms, end_ms, text, key) per usable caption of an SRT; [] if unreadable."""
     try:
         content = read_text(chunk_srt_path)
     except OSError:
-        return None
+        return []
     entries: list[tuple[int, int, str, str]] = []
     for block in split_srt_blocks(content):
         lines = re.split(r"\r?\n", block)
@@ -629,74 +892,34 @@ def detect_transcription_loop(
             continue
         text = normalize_caption_text(lines[2:])
         key = normalize_repeated_sentence_key(text)
-        if not key:
-            continue
-        entries.append((start_ms, end_ms, text, key))
-    # Single-block loop: one giant caption of the same sentence.
-    for start_ms, end_ms, text, _key in entries:
-        if _block_intra_repeat_ratio(text) >= 0.5:
-            return (start_ms, 1, end_ms - start_ms, text)
-    best: tuple[int, int, int, str] | None = None
-    current_key: str | None = None
-    current_start = 0
-    current_end = 0
-    current_length = 0
-    current_text = ""
+        if key:
+            entries.append((start_ms, end_ms, text, key))
+    return entries
 
-    def consider() -> None:
-        nonlocal best
-        if current_key is None or current_length <= 0:
-            return
-        span_ms = current_end - current_start
-        if best is None or (current_length, span_ms) > (best[1], best[2]):
-            best = (current_start, current_length, span_ms, current_text)
 
-    for start_ms, end_ms, text, key in entries:
-        if key == current_key:
-            current_length += 1
-            current_end = end_ms
-        else:
-            consider()
-            current_key = key
-            current_start = start_ms
-            current_end = end_ms
-            current_length = 1
-            current_text = text
-    consider()
-    # A-B-A-B alternation: exact-run detector never exceeds length 1.
-    # A window of 8 blocks over <= 2 fuzzy-distinct captions is a loop
-    # (real dialogue alternates speakers, not identical sentences).
-    if best is None or best[1] < 6:
-        window = 8
-        for index in range(len(entries) - window + 1):
-            window_entries = entries[index:index + window]
-            distinct: list[str] = []
-            matched = True
-            for _start_ms, _end_ms, _text, key in window_entries:
-                placed = False
-                for seen in distinct:
-                    if _captions_are_near_identical(key, seen):
-                        placed = True
-                        break
-                if not placed:
-                    distinct.append(key)
-                    if len(distinct) > 2:
-                        matched = False
-                        break
-            if not matched or len(distinct) > 2:
-                continue
-            alternate_a = {window_entries[i][3] for i in range(0, window, 2)}
-            alternate_b = {window_entries[i][3] for i in range(1, window, 2)}
-            if len(alternate_a) == 1 and len(alternate_b) == 1:
-                span_ms = window_entries[-1][1] - window_entries[0][0]
-                return (window_entries[0][0], window, span_ms, window_entries[0][2])
-    if best is not None and (
-        (best[1] >= TRANSCRIPTION_LOOP_MIN_REPEATS
-         and best[2] >= TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS * 1_000)
-        or best[1] >= TRANSCRIPTION_LOOP_BURST_REPEATS
-    ):
-        return best
-    return None
+def detect_transcription_loop(
+    chunk_srt_path: Path,
+) -> tuple[int, int, int, str] | None:
+    """Widest decoder loop in a chunk SRT, or None.
+
+    Returns (onset_ms, caption_count, span_ms, text) in the chunk-local clock.
+    Whole-chunk checks would miss the tail shape (a chunk had 247 blocks and
+    only the tail looped), so detection is span-localized and reports the
+    onset. See find_transcription_loop_spans for what counts as a loop.
+    """
+    entries = _read_loop_entries(chunk_srt_path)
+    spans = find_transcription_loop_spans(entries)
+    if not spans:
+        return None
+    first, last = max(
+        spans, key=lambda item: (entries[item[1]][1] - entries[item[0]][0], item[1] - item[0]),
+    )
+    return (
+        entries[first][0],
+        last - first + 1,
+        entries[last][1] - entries[first][0],
+        entries[first][2],
+    )
 
 
 def transcription_chunk_max_rms(chunk_audio_path: Path) -> float | None:
@@ -738,36 +961,30 @@ def _chunk_audio_is_silent(chunk_audio_path: Path) -> tuple[bool, float | None]:
     return peak_rms < TRANSCRIPTION_SILENCE_RMS, peak_rms
 
 
-def _chunk_retries_path(chunk_dir: Path) -> Path:
-    return chunk_dir / "chunk_retries.json"
-
-
 def _transcription_warnings_path(chunk_dir: Path) -> Path:
     return chunk_dir / "transcription_warnings.json"
 
 
-def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
-    """Retry verdicts are only valid for the chunk layout that produced them."""
+def _decode_state_path(chunk_dir: Path) -> Path:
+    return chunk_dir / "chunk_decode_state.json"
+
+
+# Pre-2026-10-14 builds kept this decode fingerprint inside the loop-retry
+# verdict cache. Still read once so VODs decoded by those builds are judged
+# stale or current correctly; deleted by _save_decode_state.
+_LEGACY_RETRY_STATE_NAME = "chunk_retries.json"
+_LEGACY_RETRY_SUBCHUNK = re.compile(r"_chunk_\d+(R\d+[ab])+\.(wav|srt)$")
+
+
+def _current_decode_state() -> dict[str, object]:
+    """What every chunk SRT in this folder must have been decoded with."""
     return {
-        "source_audio": manifest.get("source_audio"),
-        "duration_ms": manifest.get("duration_ms"),
-        "chunk_minutes": manifest.get("chunk_minutes"),
-        "overlap_seconds": manifest.get("overlap_seconds"),
-        "loop_min_repeats": TRANSCRIPTION_LOOP_MIN_REPEATS,
-        "loop_min_span_seconds": TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS,
-        "loop_burst_repeats": TRANSCRIPTION_LOOP_BURST_REPEATS,
-        "retry_min_minutes": TRANSCRIPTION_RETRY_MIN_MINUTES,
-        "retry_budget_factor": TRANSCRIPTION_RETRY_BUDGET_FACTOR,
-        "silence_rms": TRANSCRIPTION_SILENCE_RMS,
-        # Model marker: kept so turbo-era verdicts (different decode text)
-        # never validate - a turbo SRT reused under large would stitch the
-        # wrong model's output. One-shot: after the first large run saves a
-        # fresh fingerprint, turbo-era states clear once via
-        # _clear_stale_decode_srts below, then this is a no-op.
+        # Weights: a turbo SRT reused under large would stitch the wrong
+        # model's text.
         "whisper_model": Path(resolve_whisper_model_path()).name,
         # Decode-generation marker: bump the string whenever
         # _transcribe_audio_chunk flags change (temperature, beam, best-of,
-        # entropy/logprob/no-speech thresholds). Stale SRTs decoded under
+        # entropy/logprob/no-speech thresholds, -mc). Stale SRTs decoded under
         # older flags are otherwise valid files, so without this the loader
         # below would silently reuse them and the flag change would only
         # apply to new VODs. The configurable decode inputs (-mc context and
@@ -778,273 +995,98 @@ def _retry_state_fingerprint(manifest: dict[str, object]) -> dict[str, object]:
             f"-mc{TRANSCRIPTION_MAX_CONTEXT}-lang{TRANSCRIPTION_LANGUAGE}"
         ),
         # One-way marker: every state written before the --vad removal lacks
-        # this key, so its fingerprint can never equal a post-removal one.
-        # Without it, a VAD-era state (same layout + knobs) would compare
-        # equal and its smeared SRTs would be silently reused.
+        # this key, so a VAD-era state can never compare equal and its
+        # smeared SRTs are never reused.
         "vad_removed": True,
     }
 
 
-def _load_retry_state(
-    chunk_dir: Path, manifest: dict[str, object]
-) -> dict[str, dict[str, object]]:
-    try:
-        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(state, dict) or state.get("fingerprint") != _retry_state_fingerprint(manifest):
-        return {}
-    retries = state.get("retries")
-    return retries if isinstance(retries, dict) else {}
-
-
-def _save_retry_state(
-    chunk_dir: Path, manifest: dict[str, object], retries: dict[str, dict[str, object]]
-) -> None:
-    temporary_path = _chunk_retries_path(chunk_dir).with_suffix(".json.tmp")
-    temporary_path.write_text(
-        json.dumps({"fingerprint": _retry_state_fingerprint(manifest), "retries": retries}, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(_chunk_retries_path(chunk_dir))
-
-
-def _read_retry_manifest(chunk_dir: Path) -> dict[str, object]:
-    """Manifest dict for retry fingerprinting; empty when unreadable."""
-    try:
-        manifest = json.loads(_chunk_manifest_path(chunk_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return manifest if isinstance(manifest, dict) else {}
-
-
-def _retry_min_span_ms() -> int:
-    return max(1, TRANSCRIPTION_RETRY_MIN_MINUTES) * 60 * 1_000
-
-
-def _can_subdivide_span(start_ms: int, end_ms: int) -> bool:
-    """A span splits only when both halves stay above the retry floor."""
-    if end_ms - start_ms < 2 * _retry_min_span_ms():
-        return False
-    return (start_ms + end_ms) // 2 not in (start_ms, end_ms)
-
-
-def _extract_retry_subchunk(
-    audio_path: Path, start_ms: int, end_ms: int, dest_path: Path
-) -> None:
-    """Slice a retry sub-window from the full mic audio (ffmpeg, reuse if kept)."""
-    if dest_path.is_file() and dest_path.stat().st_size > 0:
-        return
-    start_seconds = start_ms / 1_000
-    duration_seconds = (end_ms - start_ms) / 1_000
-    ffmpeg_result = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            "-ss", f"{start_seconds:.3f}",
-            "-i", str(audio_path),
-            "-t", f"{duration_seconds:.3f}",
-            "-map", "0:a:0",
-            "-c:a", "pcm_s16le",
-            str(dest_path),
-        ]
-    )
-    if (
-        ffmpeg_result.returncode != 0
-        or not dest_path.is_file()
-        or dest_path.stat().st_size <= 0
+def _stored_decode_state(chunk_dir: Path) -> dict[str, object] | None:
+    """Decode state a previous run saved, or None for a fresh chunk folder."""
+    for path, legacy in (
+        (_decode_state_path(chunk_dir), False),
+        (chunk_dir / _LEGACY_RETRY_STATE_NAME, True),
     ):
-        raise RuntimeError(f"ffmpeg failed to create retry sub-chunk {dest_path.name}.")
-
-
-def _resolve_retry_span(
-    audio_path: Path,
-    chunk_dir: Path,
-    name_prefix: str,
-    span_start_ms: int,
-    span_end_ms: int,
-    depth: int,
-    extra_budget: list[int],
-    duration_ms: int,
-    chunk_label: str,
-    warnings: list[dict[str, object]],
-) -> list[tuple[Path, int]]:
-    """Transcribe a span as overlapped halves, recursing into looped pieces.
-
-    Returns (srt_path, offset_ms) pairs replacing the failed span. extra_budget
-    caps total Whisper invocations across the run: recursion stops when it
-    hits zero, and the span decodes once and is accepted with a warning.
-    Silent halves skip Whisper entirely (muted mic needs no GPU). Empty
-    output over live audio at/below the retry floor still decodes once so
-    the stitched SRT has no holes; the warning flags it for review.
-    """
-    overlap_ms = TRANSCRIPTION_CHUNK_OVERLAP_SECONDS * 1_000
-    middle_ms = (span_start_ms + span_end_ms) // 2
-    halves = [
-        (span_start_ms, min(middle_ms + overlap_ms, duration_ms), f"R{depth}a"),
-        (max(middle_ms - overlap_ms, 0), span_end_ms, f"R{depth}b"),
-    ]
-    resolved: list[tuple[Path, int]] = []
-    for sub_start_ms, sub_end_ms, suffix in halves:
-        sub_stem = f"{name_prefix}{suffix}"
-        sub_wav_path = chunk_dir / f"{sub_stem}.wav"
-        sub_srt_path = chunk_dir / f"{sub_stem}.srt"
-        _extract_retry_subchunk(audio_path, sub_start_ms, sub_end_ms, sub_wav_path)
-        if not (sub_srt_path.is_file() and sub_srt_path.stat().st_size > 0):
-            is_silent, peak_rms = _chunk_audio_is_silent(sub_wav_path)
-            if is_silent:
-                rms_text = f"{peak_rms:.5f}" if peak_rms is not None else "unknown"
-                print(f"[SILENT] {sub_stem}: silent audio (rms {rms_text}), skipping Whisper decode.", flush=True)
-                sub_srt_path.touch(exist_ok=True)
-                warnings.append({
-                    "chunk": chunk_label,
-                    "kind": "silent-span",
-                    "detail": f"{sub_stem}: silent audio (rms {rms_text}); decode skipped as muted mic.",
-                })
-                resolved.append((sub_srt_path, sub_start_ms))
-                continue
-            if extra_budget[0] <= 0:
-                warnings.append({
-                    "chunk": chunk_label,
-                    "kind": "budget-exhausted",
-                    "detail": f"{sub_stem}: retry budget spent; decoded once and accepted, flagged for review.",
-                })
-                print(
-                    f"[RETRY] {sub_stem}: budget exhausted, decoding once and accepting.",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"Running Whisper for chunk {chunk_label} retry sub-chunk "
-                    f"(depth {depth}): {sub_wav_path.name}",
-                    flush=True,
-                )
-                extra_budget[0] -= 1
-            _transcribe_audio_chunk(sub_wav_path, sub_srt_path)
-        block_count = _count_transcription_blocks(sub_srt_path)
-        if block_count == 0:
-            peak_rms = transcription_chunk_max_rms(sub_wav_path)
-            if peak_rms is not None and peak_rms < TRANSCRIPTION_SILENCE_RMS:
-                warnings.append({
-                    "chunk": chunk_label,
-                    "kind": "silent-span",
-                    "detail": f"{sub_stem}: empty output over silent audio (rms {peak_rms:.5f}); accepted.",
-                })
-                print(f"[SILENT] {sub_stem}: silent audio, accepting empty SRT.", flush=True)
-                resolved.append((sub_srt_path, sub_start_ms))
-            elif _can_subdivide_span(sub_start_ms, sub_end_ms) and extra_budget[0] > 0:
-                resolved.extend(_resolve_retry_span(
-                    audio_path, chunk_dir, sub_stem, sub_start_ms, sub_end_ms,
-                    depth + 1, extra_budget, duration_ms, chunk_label, warnings,
-                ))
-            else:
-                # Below the floor or out of budget: decode once and accept so
-                # the stitched SRT covers this span (flagged for review).
-                # Never append an empty SRT without an entry - that left
-                # transcript HOLES skipping the audio entirely (2026-10-06).
-                reason = "below the retry floor" if extra_budget[0] > 0 else "retry budget spent"
-                warnings.append({
-                    "chunk": chunk_label,
-                    "kind": "budget-exhausted" if extra_budget[0] <= 0 else "empty-accepted",
-                    "detail": f"{sub_stem}: empty output over live audio {reason}; decoded once and accepted, flagged for review.",
-                })
-                print(f"[RETRY] {sub_stem}: empty over live audio {reason}, decoding once and accepting.", flush=True)
-                _transcribe_audio_chunk(sub_wav_path, sub_srt_path)
-                resolved.append((sub_srt_path, sub_start_ms))
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        loop = detect_transcription_loop(sub_srt_path)
-        if loop is None:
-            resolved.append((sub_srt_path, sub_start_ms))
-        elif _can_subdivide_span(sub_start_ms, sub_end_ms) and extra_budget[0] > 0:
-            onset_ms, run_length, span_ms, _text = loop
-            print(
-                f"[LOOP] {sub_srt_path.name}: {run_length}x repeat spanning "
-                f"{span_ms // 1_000}s from local {format_plain_time(onset_ms)} - subdividing.",
-                flush=True,
-            )
-            resolved.extend(_resolve_retry_span(
-                audio_path, chunk_dir, sub_stem, sub_start_ms, sub_end_ms,
-                depth + 1, extra_budget, duration_ms, chunk_label, warnings,
-            ))
-        else:
-            _onset_ms, run_length, span_ms, _text = loop
-            reason = "below the retry floor" if extra_budget[0] > 0 else "retry budget spent"
-            warnings.append({
-                "chunk": chunk_label,
-                "kind": "budget-exhausted" if extra_budget[0] <= 0 else "loop-accepted",
-                "detail": f"{sub_stem}: {run_length}x repeat over {span_ms // 1_000}s {reason}; kept and flagged.",
-            })
-            print(f"[RETRY] {sub_stem}: loop {reason}, keeping output and flagging it.", flush=True)
-            resolved.append((sub_srt_path, sub_start_ms))
-    return resolved
+        if legacy and isinstance(state, dict):
+            state = state.get("fingerprint")
+        if isinstance(state, dict):
+            return state
+    return None
 
 
+def _clear_stale_decode_srts(chunk_dir: Path) -> None:
+    """Delete chunk SRTs decoded under an older model, flag set, or VAD era.
 
-def _resolve_manifest_chunk(
-    audio_path: Path,
-    chunk_dir: Path,
+    The weights, the decoder flags, and the old always-on --vad all change
+    the SRT bytes, so an SRT from an older generation is stale even though
+    its audio is untouched. One-shot: once a current-generation run saves
+    its decode state, this is a no-op. Chunk audio is reused.
+    """
+    stored = _stored_decode_state(chunk_dir)
+    if stored is None:
+        return
+    current = _current_decode_state()
+    if all(stored.get(key) == value for key, value in current.items()):
+        return
+    reason = (
+        "Whisper model or decode flags changed"
+        if stored.get("vad_removed") is True
+        else "Old VAD-era transcription found"
+    )
+    removed = 0
+    for srt_path in sorted(chunk_dir.glob("*.srt")):
+        try:
+            srt_path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    print(
+        f"{reason}; removed {removed} stale chunk SRT(s) for re-transcription. "
+        "Chunk audio is reused.",
+        flush=True,
+    )
+
+
+def _save_decode_state(chunk_dir: Path) -> None:
+    """Record the decode state, and retire the legacy loop-retry artifacts."""
+    temporary_path = _decode_state_path(chunk_dir).with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(_current_decode_state(), indent=2), encoding="utf-8")
+    temporary_path.replace(_decode_state_path(chunk_dir))
+    legacy_path = chunk_dir / _LEGACY_RETRY_STATE_NAME
+    if not legacy_path.is_file():
+        return
+    # The retry layer is gone: its verdict cache and the R1a/R1b... sub-chunk
+    # WAV/SRT pairs it left behind are dead weight (15 min of audio each).
+    for stale_path in chunk_dir.iterdir():
+        if stale_path.name == _LEGACY_RETRY_STATE_NAME or _LEGACY_RETRY_SUBCHUNK.search(stale_path.name):
+            try:
+                stale_path.unlink()
+            except OSError:
+                pass
+
+
+def _transcribe_manifest_chunk(
     chunk_audio_path: Path,
-    chunk_offset_ms: int,
     chunk_label: str,
-    extra_budget: list[int],
-    duration_ms: int,
-    retries: dict[str, dict[str, object]],
     warnings: list[dict[str, object]],
-) -> list[tuple[Path, int]]:
-    """Stitch entries for one prepared chunk: its SRT when clean, else retried subs.
+) -> Path:
+    """SRT for one prepared chunk: decoded once (or reused), cleaned, then checked.
 
-    Cached verdicts in chunk_retries.json skip re-detection on reruns; looped or
-    empty-over-live chunks subdivide into fresh-context halves inside the shared
-    extra-run budget. Silent chunks (muted mic) are accepted as-is.
+    Order matters. Hallucinated captions are stripped BEFORE loop detection
+    so filler chains over silence are not mistaken for decoder loops. A loop
+    that survives is flagged, not re-decoded: with -mc 0 the 43 chunks of five
+    VODs (about 20 h) produced none, and a retry decodes the same audio with
+    the same flags. Step 3 collapses whatever slips through.
     """
     chunk_srt_path = chunk_audio_path.with_suffix(".srt")
     chunk_name = chunk_audio_path.name
-    wav_size = chunk_audio_path.stat().st_size
-    entry = retries.get(chunk_name)
-    if (
-        isinstance(entry, dict)
-        and entry.get("wav_size") == wav_size
-        and entry.get("verdict") in ("clean", "silent")
-        and chunk_srt_path.is_file()
-    ):
-        print(
-            f"Chunk {chunk_label}: {chunk_srt_path.name} already checked, reusing it.",
-            flush=True,
-        )
-        return [(chunk_srt_path, chunk_offset_ms)]
-    if (
-        isinstance(entry, dict)
-        and entry.get("verdict") == "retried"
-        and entry.get("wav_size") == wav_size
-        and isinstance(entry.get("subs"), list)
-        and entry["subs"]
-    ):
-        resolved: list[tuple[Path, int]] = []
-        complete = True
-        for sub in entry["subs"]:
-            if not isinstance(sub, dict):
-                complete = False
-                break
-            sub_srt_path = chunk_dir / str(sub.get("filename"))
-            sub_offset_ms = sub.get("offset_ms")
-            if not (
-                isinstance(sub_offset_ms, int)
-                and sub_srt_path.with_suffix(".wav").is_file()
-                and sub_srt_path.with_suffix(".wav").stat().st_size > 0
-                and sub_srt_path.is_file()
-            ):
-                complete = False
-                break
-            resolved.append((sub_srt_path, sub_offset_ms))
-        if complete:
-            print(
-                f"Chunk {chunk_label}: reusing {len(resolved)} retry sub-chunk(s).",
-                flush=True,
-            )
-            return resolved
-    if not (chunk_srt_path.is_file() and chunk_srt_path.stat().st_size > 0):
+    if chunk_srt_path.is_file():
+        _clean_chunk_srt(chunk_audio_path, chunk_srt_path, chunk_label, warnings)
+    else:
         is_silent, peak_rms = _chunk_audio_is_silent(chunk_audio_path)
         if is_silent:
             rms_text = f"{peak_rms:.5f}" if peak_rms is not None else "unknown"
@@ -1058,159 +1100,47 @@ def _resolve_manifest_chunk(
                 "kind": "silent-span",
                 "detail": f"{chunk_name}: silent audio (rms {rms_text}); decode skipped as muted mic.",
             })
-            retries[chunk_name] = {"wav_size": wav_size, "verdict": "silent", "subs": []}
             chunk_srt_path.touch(exist_ok=True)
-            return [(chunk_srt_path, chunk_offset_ms)]
+            return chunk_srt_path
         print(
-            f"Running Whisper for chunk {chunk_label}: {chunk_audio_path.name}",
+            f"Running Whisper for chunk {chunk_label}: {chunk_name}",
             flush=True,
         )
-        _transcribe_audio_chunk(chunk_audio_path, chunk_srt_path)
-    block_count = _count_transcription_blocks(chunk_srt_path)
-    if block_count == 0:
+        _decode_chunk(chunk_audio_path, chunk_srt_path, chunk_label, warnings)
+    if _count_transcription_blocks(chunk_srt_path) == 0:
         peak_rms = transcription_chunk_max_rms(chunk_audio_path)
         if peak_rms is not None and peak_rms < TRANSCRIPTION_SILENCE_RMS:
-            print(
-                f"[SILENT] {chunk_srt_path.name}: silent audio (rms {peak_rms:.5f}), "
-                "accepting empty SRT.",
-                flush=True,
-            )
             warnings.append({
                 "chunk": chunk_label,
                 "kind": "silent-span",
                 "detail": f"{chunk_name}: empty output over silent audio; accepted as muted mic.",
             })
-            retries[chunk_name] = {"wav_size": wav_size, "verdict": "silent", "subs": []}
-            return [(chunk_srt_path, chunk_offset_ms)]
-        problem = "empty output over live audio"
-    else:
-        loop = detect_transcription_loop(chunk_srt_path)
-        if loop is None:
-            retries[chunk_name] = {"wav_size": wav_size, "verdict": "clean", "subs": []}
-            return [(chunk_srt_path, chunk_offset_ms)]
+        else:
+            rms_text = f"{peak_rms:.5f}" if peak_rms is not None else "unknown"
+            print(f"[EMPTY] {chunk_name}: no captions over live audio (rms {rms_text}).", flush=True)
+            warnings.append({
+                "chunk": chunk_label,
+                "kind": "empty-over-live-audio",
+                "detail": f"{chunk_name}: no captions over live audio (peak rms {rms_text}); accepted, review.",
+            })
+        return chunk_srt_path
+    loop = detect_transcription_loop(chunk_srt_path)
+    if loop is not None:
         onset_ms, run_length, span_ms, _text = loop
         print(
             f"[LOOP] {chunk_srt_path.name}: {run_length}x repeat spanning "
-            f"{span_ms // 1_000}s from local {format_plain_time(onset_ms)} - subdividing.",
+            f"{span_ms // 1_000}s from local {format_plain_time(onset_ms)} - kept and flagged.",
             flush=True,
         )
-        problem = f"{run_length}x repeat over {span_ms // 1_000}s"
-    try:
-        parent_span_ms = round(probe_audio_duration_seconds(chunk_audio_path) * 1_000)
-    except RuntimeError:
         warnings.append({
             "chunk": chunk_label,
-            "kind": "span-unmeasurable",
-            "detail": f"{chunk_name}: {problem}; audio length unreadable, keeping output as-is.",
+            "kind": "loop-detected",
+            "detail": (
+                f"{chunk_name}: {run_length}x repeat over {span_ms // 1_000}s from local "
+                f"{format_plain_time(onset_ms)}; kept, Step 3 collapses it."
+            ),
         })
-        print(f"[RETRY] {chunk_name}: cannot measure span, keeping output.", flush=True)
-        retries[chunk_name] = {"wav_size": wav_size, "verdict": "accepted", "subs": []}
-        return [(chunk_srt_path, chunk_offset_ms)] if block_count > 0 else []
-    span_start_ms = chunk_offset_ms
-    span_end_ms = min(chunk_offset_ms + parent_span_ms, duration_ms)
-    if not _can_subdivide_span(span_start_ms, span_end_ms):
-        warnings.append({
-            "chunk": chunk_label,
-            "kind": "loop-accepted" if block_count > 0 else "empty-accepted",
-            "detail": f"{chunk_name}: {problem} below the retry floor; accepted.",
-        })
-        print(f"[RETRY] {chunk_name}: below retry floor, accepting and flagging.", flush=True)
-        retries[chunk_name] = {"wav_size": wav_size, "verdict": "accepted", "subs": []}
-        return [(chunk_srt_path, chunk_offset_ms)] if block_count > 0 else []
-    resolved = _resolve_retry_span(
-        audio_path, chunk_dir, chunk_audio_path.stem,
-        span_start_ms, span_end_ms, 1, extra_budget, duration_ms, chunk_label, warnings,
-    )
-    warnings.append({
-        "chunk": chunk_label,
-        "kind": "loop-subdivided",
-        "detail": f"{chunk_name}: {problem}; split into {len(resolved)} replacement span(s).",
-    })
-    retries[chunk_name] = {
-        "wav_size": wav_size,
-        "verdict": "retried",
-        "subs": [{"filename": path.name, "offset_ms": offset} for path, offset in resolved],
-    }
-    return resolved
-
-
-def _clear_stale_decode_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
-    """Delete chunk SRTs decoded under an older model or decode-flag set.
-
-    Both the weights (large vs turbo-era) and the decoder flags change the
-    SRT bytes, so an SRT produced under either older generation is stale
-    even though its audio is untouched. Caught when the stored fingerprint
-    is post-VAD-removal (has vad_removed) but differs in whisper_model or
-    decode_flags. One-shot: after the first current-generation run saves a
-    fresh fingerprint, this is a no-op. Chunk audio is reused.
-    """
-    if not manifest:
-        return
-    try:
-        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if not isinstance(state, dict) or not isinstance(state.get("fingerprint"), dict):
-        return
-    if state.get("fingerprint") == _retry_state_fingerprint(manifest):
-        return
-    if state["fingerprint"].get("vad_removed") is not True:
-        return
-    stored = state["fingerprint"]
-    current = _retry_state_fingerprint(manifest)
-    if (
-        stored.get("whisper_model") == current.get("whisper_model")
-        and stored.get("decode_flags") == current.get("decode_flags")
-    ):
-        return
-    removed = 0
-    for srt_path in sorted(chunk_dir.glob("*.srt")):
-        try:
-            srt_path.unlink()
-            removed += 1
-        except OSError:
-            pass
-    print(
-        "Whisper model or decode flags changed; removed {0} stale chunk SRT(s) "
-        "for re-transcription. Chunk audio is reused.".format(removed),
-        flush=True,
-    )
-
-
-def _clear_vad_era_srts(chunk_dir: Path, manifest: dict[str, object]) -> None:
-    """Delete chunk SRTs transcribed under the old always-on --vad.
-
-    The VAD-era concatenated-speech decode produced smeared timestamps, so
-    any chunk SRT from before the removal is stale even though its audio is
-    untouched. Pre-removal fingerprints lack the vad_removed marker, so they
-    can never equal a post-removal one; that inequality alone identifies
-    them. Runs cleanly exactly once: after the first post-removal run saves
-    a fresh fingerprint, this is a no-op.
-    """
-    if not manifest:
-        return
-    try:
-        state = json.loads(_chunk_retries_path(chunk_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if not isinstance(state, dict) or not isinstance(state.get("fingerprint"), dict):
-        return
-    if state.get("fingerprint") == _retry_state_fingerprint(manifest):
-        return
-    if state["fingerprint"].get("vad_removed") is True:
-        return
-    removed = 0
-    for srt_path in sorted(chunk_dir.glob("*.srt")):
-        try:
-            srt_path.unlink()
-            removed += 1
-        except OSError:
-            pass
-    print(
-        "Old VAD-era transcription found; removed {0} stale chunk SRT(s) "
-        "for wall-clock re-transcription. Chunk audio is reused.".format(removed),
-        flush=True,
-    )
+    return chunk_srt_path
 
 
 def transcribe_audio_in_chunks(
@@ -1222,7 +1152,6 @@ def transcribe_audio_in_chunks(
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     chunk_audio_paths, chunk_offsets_ms = _load_prepared_audio_chunks(audio_path)
-    chunk_srt_paths: list[Path] = []
     print(
         f"Transcribing {audio_path.name} in {len(chunk_audio_paths)} saved chunk(s) "
         f"with {Path(resolve_whisper_model_path()).name}; "
@@ -1239,42 +1168,25 @@ def transcribe_audio_in_chunks(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     chunk_dir = chunk_audio_paths[0].parent
-    manifest = _read_retry_manifest(chunk_dir)
-    _clear_stale_decode_srts(chunk_dir, manifest)
-    _clear_vad_era_srts(chunk_dir, manifest)
-    duration_ms = manifest.get("duration_ms")
-    if not isinstance(duration_ms, int) or duration_ms <= 0:
-        duration_ms = round(probe_audio_duration_seconds(audio_path) * 1_000)
-    retries = _load_retry_state(chunk_dir, manifest)
+    _clear_stale_decode_srts(chunk_dir)
+    _save_decode_state(chunk_dir)
     warnings: list[dict[str, object]] = []
-    extra_budget = [max(0, math.ceil(len(chunk_audio_paths) * TRANSCRIPTION_RETRY_BUDGET_FACTOR))]
-    print(
-        f"Loop-retry budget: {extra_budget[0]} extra Whisper run(s) for this run.",
-        flush=True,
-    )
-    chunk_entries: list[tuple[Path, int]] = []
-    for chunk_number, (chunk_audio_path, chunk_offset_ms) in enumerate(
-        zip(chunk_audio_paths, chunk_offsets_ms), start=1
-    ):
-        chunk_label = f"{chunk_number:02d}/{len(chunk_audio_paths):02d}"
-        chunk_entries.extend(_resolve_manifest_chunk(
-            audio_path, chunk_dir, chunk_audio_path, chunk_offset_ms,
-            chunk_label, extra_budget, duration_ms, retries, warnings,
-        ))
-        _save_retry_state(chunk_dir, manifest, retries)
+    chunk_srt_paths = [
+        _transcribe_manifest_chunk(
+            chunk_audio_path, f"{chunk_number:02d}/{len(chunk_audio_paths):02d}", warnings,
+        )
+        for chunk_number, chunk_audio_path in enumerate(chunk_audio_paths, start=1)
+    ]
 
     warnings_path = _transcription_warnings_path(chunk_dir)
     warnings_temporary_path = warnings_path.with_suffix(".json.tmp")
     warnings_temporary_path.write_text(json.dumps(warnings, indent=2), encoding="utf-8")
     warnings_temporary_path.replace(warnings_path)
     print(
-        f"Retry summary: {len(chunk_entries)} span(s) to stitch, "
+        f"Transcription summary: {len(chunk_srt_paths)} chunk(s), "
         f"{len(warnings)} warning(s) in {warnings_path.name}.",
         flush=True,
     )
-    chunk_srt_paths = [entry_path for entry_path, _offset_ms in chunk_entries]
-    chunk_offsets_ms = [entry_offset_ms for _entry_path, entry_offset_ms in chunk_entries]
-
     print("All chunk SRTs finished; stitching connected timestamps.", flush=True)
     output_path = output_dir / audio_path.with_suffix(".srt").name
     return stitch_transcription_chunks(chunk_srt_paths, chunk_offsets_ms, output_path)
@@ -1296,14 +1208,30 @@ def split_caption_block(block: str, start_index: int) -> list[str]:
     return [make_srt_block(start_index, start_ms, end_ms, subtitle_text)]
 
 def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
-    """Fix bad Whisper SRT timestamps, collapse adjacent repeats, and renumber."""
+    """Fix bad Whisper SRT timestamps, clamp overlaps to wall-clock, dedup repeats."""
     input_path = input_path.resolve()
     output_path = (out_dir or input_path.parent) / f"{input_path.stem}_fixed.srt"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fixed_blocks: list[str] = []
+    block_starts: list[int | None] = []
+    block_ends: list[int | None] = []
     previous_end_ms = 0
     removed_sentence_count = 0
+    removed_overlap_count = 0
+
+    def _tail_idx() -> int | None:
+        for idx in range(len(fixed_blocks) - 1, -1, -1):
+            if block_ends[idx] is not None:
+                return idx
+        return None
+
+    def _retime_block(idx: int, start_ms: int, end_ms: int) -> None:
+        lines = re.split(r"\r?\n", fixed_blocks[idx])
+        lines[1] = f"{format_srt_time(start_ms)} --> {format_srt_time(end_ms)}"
+        fixed_blocks[idx] = "\r\n".join(lines)
+        block_starts[idx] = start_ms
+        block_ends[idx] = end_ms
 
     for block in split_srt_blocks(read_text(input_path)):
         lines = re.split(r"\r?\n", block)
@@ -1314,6 +1242,8 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
         time_line = lines[1]
         if "-->" not in time_line:
             fixed_blocks.append(block)
+            block_starts.append(None)
+            block_ends.append(None)
             continue
 
         start_text, end_text = [part.strip() for part in time_line.split("-->", 1)]
@@ -1327,11 +1257,50 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
             start_ms = previous_end_ms + 1
             end_ms = start_ms + 2_000
         elif start_ms < previous_end_ms:
-            duration_ms = end_ms - start_ms
-            if duration_ms > 5 * 60_000:
-                duration_ms = 2_000
-            start_ms = previous_end_ms + 1
-            end_ms = start_ms + duration_ms
+            # Overlapping caption: Whisper re-decoded audio an earlier block
+            # already covers (hallucinated "Thank you" chains spanning silence,
+            # chunk-seam double decodes, intra-chunk timing jitter). Shifting
+            # the current caption forward here accumulated +17 s of drift on
+            # the 2026-09-21 VOD (and compressed the Hayes->nasty gap 19.8 s
+            # to 2.1 s, defeating the merge gap-closer). Wall-clock decode
+            # times are the truth: shorten or drop the earlier block instead
+            # and keep the current caption where Whisper put it. Fully
+            # contained captions are kept too - real utterances often sit
+            # inside an over-long hallucinated span, and only the earlier
+            # block's display window shrinks; no text is ever lost here.
+            if end_ms - start_ms > 5 * 60_000:
+                end_ms = start_ms + 2_000
+            if start_ms == 0:
+                # Mid-file zero start: unplaceable (the clock never returns
+                # to zero). Shifting would drift everything after it, and the
+                # pop loop below would erase everything before it, so drop it.
+                removed_overlap_count += 1
+                continue
+            while True:
+                tail = _tail_idx()
+                if tail is None or start_ms >= previous_end_ms:
+                    break
+                tail_start = block_starts[tail]
+                assert tail_start is not None
+                new_tail_end = start_ms - 1
+                if new_tail_end <= tail_start:
+                    # Current starts at/before the tail's start (equal-start
+                    # re-decodes - the raw is start-sorted, so this is the
+                    # only way here): the tail's whole span is shadowed, so
+                    # drop it and re-check against the next earlier block.
+                    fixed_blocks.pop(tail)
+                    block_starts.pop(tail)
+                    block_ends.pop(tail)
+                    removed_overlap_count += 1
+                    new_tail = _tail_idx()
+                    if new_tail is None:
+                        previous_end_ms = 0
+                    else:
+                        previous_end_ms = block_ends[new_tail]  # type: ignore[assignment]
+                    continue
+                _retime_block(tail, tail_start, new_tail_end)
+                previous_end_ms = new_tail_end
+                break
 
         previous_end_ms = end_ms
         subtitle_text = normalize_caption_text(lines[2:])
@@ -1342,6 +1311,62 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
                 [index_line, f"{format_srt_time(start_ms)} --> {format_srt_time(end_ms)}", subtitle_text]
             )
         )
+        block_starts.append(start_ms)
+        block_ends.append(end_ms)
+
+    # Decoder-loop collapse: whatever loop Step 2 flagged (or never saw) is a
+    # stuck decoder, not speech - Thank-you chains over silence, A-B-A-B
+    # alternations like "I don't know"/"Why are you orange?" at ~1 s cadence
+    # for 13 min. Detection is the Step 2 core (find_transcription_loop_spans),
+    # so the two steps cannot disagree about what a loop is. Each loop span
+    # keeps the first caption per distinct text; captions seen once (real
+    # speech inside the span) are always their own first. No
+    # is_repeat_sentence_candidate gate: that 3-word floor exists so the
+    # adjacent-dedup pass never eats real speech ("Okay." x3 is emphasis),
+    # and inside a detected loop it would shield exactly the chains this pass
+    # exists to collapse. Kept heads retain wall-clock time; block_starts/ends
+    # stay aligned with fixed_blocks.
+    loop_collapsed_count = 0
+    collapse_marks: list[bool] = [False] * len(fixed_blocks)
+    loop_entries: list[tuple[int, int, str, str]] = []
+    loop_block_indexes: list[int] = []
+    for block_index, block in enumerate(fixed_blocks):
+        entry_start = block_starts[block_index]
+        entry_end = block_ends[block_index]
+        block_lines = re.split(r"\r?\n", block)
+        if entry_start is None or entry_end is None or len(block_lines) < 3:
+            continue
+        entry_text = normalize_caption_text(block_lines[2:])
+        entry_key = normalize_repeated_sentence_key(entry_text)
+        if entry_key:
+            loop_entries.append((entry_start, entry_end, entry_text, entry_key))
+            loop_block_indexes.append(block_index)
+    for first, last in find_transcription_loop_spans(loop_entries):
+        kept_keys: set[str] = set()
+        for entry_index in range(first, last + 1):
+            entry_key = loop_entries[entry_index][3]
+            if entry_key in kept_keys:
+                collapse_marks[loop_block_indexes[entry_index]] = True
+                loop_collapsed_count += 1
+            else:
+                kept_keys.add(entry_key)
+    if loop_collapsed_count:
+        kept_blocks: list[str] = []
+        kept_starts: list[int | None] = []
+        kept_ends: list[int | None] = []
+        for block, start, end, marked in zip(fixed_blocks, block_starts, block_ends, collapse_marks):
+            if marked:
+                continue
+            kept_blocks.append(block)
+            kept_starts.append(start)
+            kept_ends.append(end)
+        fixed_blocks = kept_blocks
+        block_starts = kept_starts
+        block_ends = kept_ends
+        previous_end_ms = 0
+        for end in block_ends:
+            if end is not None:
+                previous_end_ms = end
 
     deduped_blocks: list[str] = []
     previous_text_key: str | None = None
@@ -1358,7 +1383,6 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
 
         deduped_blocks.append(block)
         previous_text_key = text_key or None
-
     renumbered_blocks: list[str] = []
     counter = 1
     for block in deduped_blocks:
@@ -1366,8 +1390,12 @@ def fix_srt(input_path: Path, out_dir: Path | None = None) -> Path:
         renumbered_blocks.extend(split_blocks)
         counter += len(split_blocks)
 
+    if loop_collapsed_count:
+        print(f"Collapsed {loop_collapsed_count} decoder-loop caption(s) to run heads")
     if removed_block_count:
         print(f"Removed {removed_block_count} consecutive repeated subtitle block(s)")
+    if removed_overlap_count:
+        print(f"Trimmed {removed_overlap_count} overlapping caption(s) back to wall-clock time")
     if removed_sentence_count:
         print(f"Removed {removed_sentence_count} consecutive repeated sentence(s)")
 

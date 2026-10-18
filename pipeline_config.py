@@ -84,6 +84,13 @@ def step_subdir(stream_folder, step: int):
 # below carry the entries for every other model (including qwen3:8b).
 # qwen3.6:35b-a3b / qwen3.5:35b need partial CPU offload, so their presets
 # use a smaller context to leave memory for KV cache.
+# NOTE 2026-10-08: an "untrusted mount point" CreateFile 500 on every load of
+# a model tag means the local Ollama store is corrupt for that tag (seen
+# once: a cp-created alias left a symlink-to-manifest-LIST the server kept
+# re-resolving and failing to open). Reinstalling Ollama / re-pulling the tag
+# clean resolves it - a healthy tag is a regular-file manifest (verified
+# stable across rapid + idle-crossing loads). This is NOT an Ollama 0.40
+# regression: fresh pulls write the same layout and stay stable.
 MODEL = os.environ.get("HIGHLIGHT_MODEL", "qwen3.5:9b-q4_K_M")
 JUDGE_MODEL = os.environ.get("HIGHLIGHT_JUDGE_MODEL", "qwen3.5:9b-q4_K_M")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
@@ -141,18 +148,16 @@ LLAMA_JUDGE_MODEL_PATH = os.environ.get("LLAMA_JUDGE_MODEL_PATH", LLAMA_MODEL_PA
 LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 
 # --- Transcription -----------------------------------------------------------
-# Long uninterrupted Whisper runs can enter a repeated-text decoding loop.
-# Independent chunks reset the decoder context; overlap protects words at
-# chunk boundaries. Both values remain environment-overridable for tuning.
-# When a finished chunk SRT is dominated by one repeated caption (a decoder
-# loop, not real speech), Step 2 subdivides that span and re-transcribes the
-# halves with fresh decoder contexts instead of stitching the loop through.
-# Subdivision stops at TRANSCRIPTION_RETRY_MIN_MINUTES and the run caps extra
-# Whisper invocations at TRANSCRIPTION_RETRY_BUDGET_FACTOR times the chunk
-# count (2.0: a pathological VOD burns bounded GPU and records the surviving
-# suspect spans in transcription_warnings.json instead of hanging the run).
-# Empty chunk SRTs over near-silent audio (a muted mic) are accepted as-is;
-# only empty output over live audio re-enters the retry path.
+# Whisper decodes each saved chunk in its own process; chunks make Step 2
+# resumable and bound per-process memory, overlap protects words at chunk
+# boundaries. Both values remain environment-overridable for tuning.
+# Repeat loops are prevented at the source (TRANSCRIPTION_MAX_CONTEXT below),
+# not recovered after the fact: Step 2 decodes every chunk once, strips
+# captions the audio cannot support (digital silence, or filler phrases over
+# faint noise), and only then checks the result for loops. A loop that still
+# gets through is recorded in transcription_warnings.json and collapsed by
+# Step 3 using the same detector. Empty chunk SRTs over near-silent audio (a
+# muted mic) are accepted as-is.
 # VAD is gone: whisper.cpp's --vad concatenated detected speech, decoded it
 # as one contiguous buffer, then stretched the captions back across the
 # excised silence (one caption per ~11 s compressed-speech span remapped onto
@@ -163,12 +168,6 @@ LLAMA_CONTEXT_SIZE = _env_int("LLAMA_CONTEXT_SIZE", 8192)
 # language makes Whisper render speech as that language instead of
 # transcribing it, which also feeds every LLM stage a distorted transcript.
 TRANSCRIPTION_LANGUAGE = os.environ.get("TRANSCRIPTION_LANGUAGE", "it").strip().lower() or "en"
-# whisper.cpp -mc: how many tokens of already-transcribed text are fed back as
-# context. -1 keeps the full context, which lets a repetition loop propagate
-# from one segment to the next (on the 2026-09-30 VOD it left 37 minutes
-# untranscribed). 0 decodes every segment independently and ended the loops on
-# all four problem spans tested.
-TRANSCRIPTION_MAX_CONTEXT = _env_int("TRANSCRIPTION_MAX_CONTEXT", 0)
 TRANSCRIPTION_CHUNK_MINUTES = _env_int("TRANSCRIPTION_CHUNK_MINUTES", 30)
 TRANSCRIPTION_CHUNK_OVERLAP_SECONDS = _env_int("TRANSCRIPTION_CHUNK_OVERLAP_SECONDS", 10)
 TRANSCRIPTION_LOOP_MIN_REPEATS = _env_int("TRANSCRIPTION_LOOP_MIN_REPEATS", 10)
@@ -177,9 +176,29 @@ TRANSCRIPTION_LOOP_MIN_SPAN_SECONDS = _env_int("TRANSCRIPTION_LOOP_MIN_SPAN_SECO
 # chain ("Thank you" every ~3 s) hits 30 repeats in ~90 s without tripping the
 # 180 s span gate. Real choruses repeat 3-5x, so 30 stays far above them.
 TRANSCRIPTION_LOOP_BURST_REPEATS = _env_int("TRANSCRIPTION_LOOP_BURST_REPEATS", 30)
-TRANSCRIPTION_RETRY_MIN_MINUTES = _env_int("TRANSCRIPTION_RETRY_MIN_MINUTES", 5)
-TRANSCRIPTION_RETRY_BUDGET_FACTOR = _env_float("TRANSCRIPTION_RETRY_BUDGET_FACTOR", 2.0)
+# Diversity gate (third OR-condition): this many captions inside a 180 s
+# window carrying at most MAX_DISTINCT different texts. Catches loops that
+# are neither a run nor a strict A/B alternation (3-cycles, "A A B") and fast
+# runs under the burst gate (18 identical captions in 18 s). Real speech
+# puts far more distinct text into 16 captions.
+TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS = _env_int("TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS", 16)
+TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT = _env_int("TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT", 3)
+TRANSCRIPTION_GENERIC_PHRASE_RMS = _env_float("TRANSCRIPTION_GENERIC_PHRASE_RMS", 0.02)
 TRANSCRIPTION_SILENCE_RMS = _env_float("TRANSCRIPTION_SILENCE_RMS", 0.002)
+# Text-context carry-over between whisper.cpp 30 s decode windows (-mc).
+# whisper.cpp's default (-1) feeds every previous window's text back in as a
+# prompt. On streamer audio (sparse speech over noise-gated dead air) the
+# decoder locks onto its own last caption and re-emits it once per window
+# ("The rest of that team was so bad." x18 = 6 min, "Why are you orange?" /
+# "I don't know." alternating for 13 min): the transcript hole is the loop
+# itself, the real speech under it is never decoded. 0 = every window decodes
+# independently (benchmarked 2026-10-14 on 3 looped chunks: all loops gone,
+# real speech recovered, healthy regions equal or better, punctuation/casing
+# restored). This fork reached the same value first: on the 2026-09-30
+# Italian VOD -1 left 37 minutes untranscribed, and 0 ended the loops on all
+# four problem spans tested. Changing it bumps the decode_flags fingerprint,
+# so existing chunk SRTs re-decode once.
+TRANSCRIPTION_MAX_CONTEXT = _env_int("TRANSCRIPTION_MAX_CONTEXT", 0)
 # Whisper weights used by Step 2 (whisper.cpp): ggml-large-v3.bin (~3 GB)
 # from the ggerganov/whisper.cpp repo. The large-v3-turbo bin was removed
 # 2026-10-03 (accuracy drop too big) - Step 2 always decodes large now, via
@@ -533,7 +552,7 @@ EDITABLE_PARAMS = [
      "help": "Language code of the audio (en, it, es, ...) or auto to detect per chunk. Must match what is spoken, otherwise Whisper outputs a distorted transcript. Changing it needs Step 2 re-run."},
     {"key": "TRANSCRIPTION_MAX_CONTEXT", "env": "TRANSCRIPTION_MAX_CONTEXT", "kind": "int", "stage": "Transcription",
      "label": "Whisper text context (TRANSCRIPTION_MAX_CONTEXT, tokens)",
-     "help": "Tokens of already-transcribed text fed back to Whisper (-mc). 0 = none, which prevents repetition loops from spreading between segments. -1 = full context (Whisper default, more coherent text but prone to loops). Changing it needs Step 2 re-run."},
+     "help": "Previous-window text fed back into the decoder (-mc). 0 decodes every 30 s window independently, which stops repeat loops that erase minutes of speech. -1 is whisper.cpp's default (unlimited carry-over, loop-prone). Changing it re-decodes existing chunk SRTs once."},
     {"key": "TRANSCRIPTION_CHUNK_MINUTES", "env": "TRANSCRIPTION_CHUNK_MINUTES", "kind": "int", "stage": "Transcription",
      "label": "Whisper chunk length (minutes)",
      "help": "Each audio chunk starts a fresh Whisper decoder context. 30 minutes is a safe default for long VODs."},
@@ -549,15 +568,18 @@ EDITABLE_PARAMS = [
     {"key": "TRANSCRIPTION_LOOP_BURST_REPEATS", "env": "TRANSCRIPTION_LOOP_BURST_REPEATS", "kind": "int", "stage": "Transcription",
      "label": "Loop burst repeats (TRANSCRIPTION_LOOP_BURST_REPEATS)",
      "help": "OR-condition: flags at this many consecutive identical captions even under the min span. Catches fast silence chains; choruses repeat far fewer times."},
-    {"key": "TRANSCRIPTION_RETRY_MIN_MINUTES", "env": "TRANSCRIPTION_RETRY_MIN_MINUTES", "kind": "int", "stage": "Transcription",
-     "label": "Retry subdivision floor minutes (TRANSCRIPTION_RETRY_MIN_MINUTES)",
-     "help": "Looped spans split in halves down to this window size, then the best effort is accepted and flagged."},
-    {"key": "TRANSCRIPTION_RETRY_BUDGET_FACTOR", "env": "TRANSCRIPTION_RETRY_BUDGET_FACTOR", "kind": "float", "stage": "Transcription",
-     "label": "Retry extra-run budget factor (TRANSCRIPTION_RETRY_BUDGET_FACTOR)",
-     "help": "Caps extra Whisper invocations at this times the chunk count so a pathological VOD burns bounded GPU."},
+    {"key": "TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS", "env": "TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS", "kind": "int", "stage": "Transcription",
+     "label": "Loop diversity window captions (TRANSCRIPTION_LOOP_DIVERSITY_CAPTIONS)",
+     "help": "OR-condition: flags when this many captions inside a 180 s window carry at most the max-distinct count below. Catches 3-cycles and fast loops the run and alternation checks miss."},
+    {"key": "TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT", "env": "TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT", "kind": "int", "stage": "Transcription",
+     "label": "Loop diversity max distinct texts (TRANSCRIPTION_LOOP_DIVERSITY_MAX_DISTINCT)",
+     "help": "Most distinct caption texts allowed inside the diversity window before it counts as a loop. Real speech has far more."},
+    {"key": "TRANSCRIPTION_GENERIC_PHRASE_RMS", "env": "TRANSCRIPTION_GENERIC_PHRASE_RMS", "kind": "float", "stage": "Transcription",
+     "label": "Filler-phrase RMS ceiling (TRANSCRIPTION_GENERIC_PHRASE_RMS)",
+     "help": "A 'Thank you.'-style filler caption over audio whose peak RMS is below this is Whisper inventing text over faint noise and is dropped. Raise it to drop more, lower it to keep quieter real filler."},
     {"key": "TRANSCRIPTION_SILENCE_RMS", "env": "TRANSCRIPTION_SILENCE_RMS", "kind": "float", "stage": "Transcription",
      "label": "Silence RMS threshold (TRANSCRIPTION_SILENCE_RMS)",
-     "help": "Empty chunk output under this audio RMS is a muted mic (accepted); empty output over louder audio is retried."},
+     "help": "Chunk audio below this RMS is a muted mic: Whisper is skipped, and any caption printed over audio this quiet is dropped as invented."},
     # --- Models (per-step role assignment) ---
     {"key": "MODEL",            "env": "HIGHLIGHT_MODEL",            "kind": "model", "stage": "Models",
      "label": "Discovery / audio-titling model (MODEL)",

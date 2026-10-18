@@ -615,17 +615,18 @@ def ensure_ollama_model_ready(model_name, url, stage_label):
         response = None
         try:
             start = time.time()
-            if url.rstrip("/").endswith("/api/chat"):
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                    "think": False,
-                    "options": {"num_predict": 1},
-                }
-            else:
-                payload = {"model": model_name, "prompt": "", "stream": False, "options": {"num_predict": 1}}
-            response = requests.post(url, json=payload, timeout=600)
+            # NOTE: warm via /api/generate (OLLAMA_URL), never /api/chat.
+            # Same store bug as the unload path: Ollama 0.40+ re-resolves the
+            # manifests-v2 tag on chat requests and rewrites a manifest-LIST
+            # tag as a symlink, which Go's CreateFile rejects on some
+            # Windows volumes ("untrusted mount point") - permanently
+            # breaking the tag mid-run. Chat payloads still work for the real
+            # inference calls (think:false); only load/unload-time requests
+            # that touch the tag file need the generate endpoint. The response
+            # shape differs but pre-warm only needs a 200.
+            warm_url = OLLAMA_URL
+            payload = {"model": model_name, "prompt": "", "stream": False, "options": {"num_predict": 1}}
+            response = requests.post(warm_url, json=payload, timeout=600)
             response.raise_for_status()
             print(f"[{stage_label}] Ollama model {model_name} ready in {time.time() - start:.0f}s.")
             return
@@ -921,12 +922,20 @@ def unload_ollama_model(model_name, label="emotion"):
         _stop_llama_server(label)
         return
     try:
+        # NOTE: unload MUST go to /api/generate (OLLAMA_URL), never
+        # /api/chat. Ollama 0.40+ resolves the model tag through a different
+        # store path per endpoint: the chat endpoint re-resolves the
+        # manifests-v2 tag file on an empty-messages unload and rewrites it
+        # as a symlink-to-manifest-LIST, which Go's CreateFile rejects on
+        # some Windows volumes ("untrusted mount point") - permanently
+        # breaking the tag until it is re-pinned. /api/generate unloads
+        # without touching the tag file (verified: tag untouched after
+        # generate-unload, symlink + 500 on chat-unload).
         requests.post(
             OLLAMA_URL,
             json={"model": model_name, "prompt": "", "keep_alive": 0},
             timeout=30,
         )
-        print(f"[{label}] Requested Ollama unload for {model_name}")
     except Exception as exc:
         print(f"[{label}] Could not unload Ollama model {model_name}: {exc}")
 
@@ -1261,10 +1270,17 @@ def similar_titles(title_a, title_b, threshold=0.75):
         return False
     return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
 
-def merge_near_duplicates(highlights_list, time_window=10):
+def merge_near_duplicates(highlights_list, time_window=10, wide_window=60):
     """Merges highlights that are within `time_window` seconds of each
     other AND have similar titles, keeping only the highest-scored one
-    from each near-duplicate group."""
+    from each near-duplicate group.
+
+    A second, wider pass catches the same rant claimed at drifted timestamps:
+    identical titles (similarity 1.0, e.g. the same lobby complaint at
+    03:35:20 and 03:35:54) merge out to `wide_window` seconds, while merely
+    similar titles keep the tight window. Different moments that happen to
+    share generic words ("What the fuck?" at 00:53 vs 01:22) score well below
+    1.0 and never merge."""
 
     sorted_highlights = sorted(
         highlights_list, key=lambda h: timestamp_to_seconds(h["Timestamp"])
@@ -1278,10 +1294,15 @@ def merge_near_duplicates(highlights_list, time_window=10):
 
         for existing in kept:
             existing_seconds = timestamp_to_seconds(existing["Timestamp"])
-
-            if abs(h_seconds - existing_seconds) <= time_window and similar_titles(
+            gap = abs(h_seconds - existing_seconds)
+            if gap <= time_window and similar_titles(
                 h["Title"], existing["Title"]
             ):
+                if h["Score"] > existing["Score"]:
+                    existing.update(h)
+                merged_into_existing = True
+                break
+            if gap <= wide_window and _titles_identical(h["Title"], existing["Title"]):
                 if h["Score"] > existing["Score"]:
                     existing.update(h)
                 merged_into_existing = True
@@ -1291,6 +1312,12 @@ def merge_near_duplicates(highlights_list, time_window=10):
             kept.append(h)
 
     return kept
+
+def _titles_identical(title_a, title_b):
+    """Normalized exact-title match for the wide-window merge pass."""
+    a = title_a.strip().lower()
+    b = title_b.strip().lower()
+    return bool(a) and a == b
 
 def parse_srt_blocks(transcript_text):
     """Parses the transcript_partN.txt block format produced by
@@ -1853,6 +1880,7 @@ def run_discovery(stream_folder, parts, prompts):
                 result = response.json().get("message", {}).get("content", "")
 
                 added = 0
+                backfilled = 0
                 rejected_hallucinated = 0
                 rejected_malformed = 0
                 no_moments_reported = 0
@@ -1894,11 +1922,23 @@ def run_discovery(stream_folder, parts, prompts):
                         if fixed:
                             pieces = [fixed.group(1), fixed.group(2)] + pieces[1:]
 
-                    if len(pieces) != 4:
+                    if len(pieces) == 3:
+                        # Scoreless row: model returned Timestamp,Title,Reason
+                        # without the Score field (seen on stock qwen3.5 across
+                        # several VODs - real moments, just missing the
+                        # judgment column). Backfill Score 5 (unjudged middle)
+                        # so verify/judge score them like everything else
+                        # instead of dropping real candidates. Must still pass
+                        # the timestamp + low-content gates below.
+                        timestamp, title, reason = pieces
+                        score = 5
+                        score_backfilled = True
+                    elif len(pieces) != 4:
                         rejected_malformed += 1
                         continue
-
-                    timestamp, score, title, reason = pieces
+                    else:
+                        timestamp, score, title, reason = pieces
+                        score_backfilled = False
 
                     timestamp = timestamp.strip()
                     match = re.search(r'(\d{2}:\d{2}:\d{2})', timestamp)
@@ -1909,11 +1949,12 @@ def run_discovery(stream_folder, parts, prompts):
 
                     timestamp = match.group(1)
 
-                    try:
-                        score = int(re.sub(r'[^\d-]', '', str(score)))
-                    except Exception:
-                        rejected_malformed += 1
-                        continue
+                    if not score_backfilled:
+                        try:
+                            score = int(re.sub(r'[^\d-]', '', str(score)))
+                        except Exception:
+                            rejected_malformed += 1
+                            continue
 
                     if real_timestamps:
                         candidate_seconds = timestamp_to_seconds(timestamp)
@@ -1936,8 +1977,10 @@ def run_discovery(stream_folder, parts, prompts):
                     })
 
                     added += 1
+                    if score_backfilled:
+                        backfilled += 1
 
-                print(f"Added {added} candidates")
+                print(f"Added {added} candidates" + (f" ({backfilled} scoreless, defaulted to 5)" if backfilled else ""))
 
                 if rejected_hallucinated > 0:
                     print(f"     [!] Rejected {rejected_hallucinated} candidates with timestamps not found in transcript")
